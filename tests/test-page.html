@@ -176,6 +176,17 @@
                 output.appendChild(el);
             }
 
+            // Test 0: Web Saver Shadow DOM host exists
+            const wsRoot = document.querySelector("ws-root");
+            log("Shadow DOM host (ws-root) exists", !!wsRoot, wsRoot ? "Found" : "NOT FOUND — script may not be loaded");
+
+            // Test 0b: Shadow DOM host is visible (position fixed, zero-size but overflow visible)
+            if (wsRoot) {
+                const hostStyle = getComputedStyle(wsRoot);
+                const isFixed = hostStyle.position === "fixed";
+                log("Shadow DOM host is position:fixed", isFixed, `position: ${hostStyle.position}`);
+            }
+
             // Test 1: Count <img> elements on page
             const allImgs = document.querySelectorAll("img");
             log("Page has img elements", allImgs.length >= 5, `Found ${allImgs.length}`);

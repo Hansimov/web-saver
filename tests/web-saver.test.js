@@ -557,43 +557,190 @@ describe("完整流水线（单元级集成测试）", () => {
     });
 });
 
-// ---- 重复 URL 追踪 ----
-describe("重复 URL 追踪", () => {
-    it("Map 应正确检测重复 URL", () => {
-        const savedUrls = new Map();
-        const url = "https://example.com/image.jpg";
-        savedUrls.set(url, "2024-01-01-120000.jpg");
-        assert(savedUrls.has(url), "应检测到重复 URL");
-        assertEqual(savedUrls.get(url), "2024-01-01-120000.jpg");
+// ---- computeHash（内容哈希） ----
+
+/**
+ * 与主脚本中 computeHash 保持一致的 cyrb53 实现
+ */
+function computeHash(buffer) {
+    const view = new Uint8Array(buffer);
+    const len = view.length;
+    let h1 = 0xdeadbeef ^ len;
+    let h2 = 0x41c6ce57 ^ len;
+    for (let i = 0; i < len; i++) {
+        h1 = Math.imul(h1 ^ view[i], 2654435761);
+        h2 = Math.imul(h2 ^ view[i], 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507);
+    h1 ^= Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507);
+    h2 ^= Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+}
+
+describe("computeHash（内容哈希）", () => {
+    it("相同内容应产生相同哈希", () => {
+        const data = new Uint8Array([1, 2, 3, 4, 5]).buffer;
+        assertEqual(computeHash(data), computeHash(data));
     });
-    it("不同 URL 不应被判定为重复", () => {
-        const savedUrls = new Map();
-        savedUrls.set("https://example.com/a.jpg", "a.jpg");
-        assert(!savedUrls.has("https://example.com/b.jpg"), "不同 URL 不应为重复");
+    it("不同内容应产生不同哈希", () => {
+        const a = new Uint8Array([1, 2, 3]).buffer;
+        const b = new Uint8Array([4, 5, 6]).buffer;
+        assert(computeHash(a) !== computeHash(b), "不同数据的哈希应不同");
     });
-    it("应统计跳过的重复图片数量", () => {
-        const savedUrls = new Map();
-        const images = [
-            { url: "https://example.com/a.jpg" },
-            { url: "https://example.com/b.jpg" },
-            { url: "https://example.com/a.jpg" },  // 重复
-            { url: "https://example.com/c.jpg" },
-            { url: "https://example.com/b.jpg" },  // 重复
-        ];
+    it("空数据应有确定性哈希", () => {
+        const empty = new Uint8Array([]).buffer;
+        const hash = computeHash(empty);
+        assert(hash.length > 0, "空数据哈希不应为空");
+        assertEqual(computeHash(empty), hash, "空数据的哈希应是确定性的");
+    });
+    it("大数据应正常计算", () => {
+        const big = new Uint8Array(100000);
+        for (let i = 0; i < big.length; i++) big[i] = i & 0xff;
+        const hash = computeHash(big.buffer);
+        assert(hash.length > 0, "大数据哈希不应为空");
+    });
+    it("仅一个字节不同应产生不同哈希", () => {
+        const a = new Uint8Array([10, 20, 30, 40, 50]);
+        const b = new Uint8Array([10, 20, 31, 40, 50]); // 第三个字节不同
+        assert(computeHash(a.buffer) !== computeHash(b.buffer), "一个字节不同的哈希应不同");
+    });
+    it("返回值应为 base36 字符串", () => {
+        const data = new Uint8Array([100, 200, 150]).buffer;
+        const hash = computeHash(data);
+        assert(/^[0-9a-z]+$/.test(hash), "哈希应仅包含 base36 字符");
+    });
+});
+
+// ---- HashStore（哈希存储） ----
+
+class MockHashStore {
+    constructor() {
+        this._store = {};
+    }
+    has(hash) { return hash in this._store; }
+    get(hash) { return this._store[hash] || null; }
+    set(hash, info) {
+        this._store[hash] = { ...info, savedAt: Date.now() };
+        this._prune();
+    }
+    get size() { return Object.keys(this._store).length; }
+    clear() { this._store = {}; }
+    _prune() {
+        const MAX = 5000;
+        const keys = Object.keys(this._store);
+        if (keys.length <= MAX) return;
+        const sorted = keys.sort((a, b) =>
+            (this._store[a].savedAt || 0) - (this._store[b].savedAt || 0)
+        );
+        const toRemove = sorted.slice(0, keys.length - MAX);
+        for (const k of toRemove) delete this._store[k];
+    }
+}
+
+describe("HashStore（哈希存储）", () => {
+    it("应存储和检索哈希记录", () => {
+        const store = new MockHashStore();
+        store.set("abc123", { filename: "photo.jpg", url: "https://example.com/photo.jpg" });
+        assert(store.has("abc123"), "应能检测到已存储的哈希");
+        assertEqual(store.get("abc123").filename, "photo.jpg");
+    });
+    it("不存在的哈希应返回 null", () => {
+        const store = new MockHashStore();
+        assert(!store.has("nonexistent"), "不存在的哈希 has 应返回 false");
+        assertEqual(store.get("nonexistent"), null);
+    });
+    it("clear 应清空所有记录", () => {
+        const store = new MockHashStore();
+        store.set("a", { filename: "a.jpg" });
+        store.set("b", { filename: "b.jpg" });
+        assertEqual(store.size, 2);
+        store.clear();
+        assertEqual(store.size, 0);
+        assert(!store.has("a"), "清空后不应检测到哈希");
+    });
+    it("size 应返回正确的条目数", () => {
+        const store = new MockHashStore();
+        assertEqual(store.size, 0);
+        store.set("x", { filename: "x.jpg" });
+        assertEqual(store.size, 1);
+        store.set("y", { filename: "y.jpg" });
+        assertEqual(store.size, 2);
+    });
+    it("set 应记录 savedAt 时间戳", () => {
+        const store = new MockHashStore();
+        const before = Date.now();
+        store.set("ts", { filename: "ts.jpg" });
+        const after = Date.now();
+        const entry = store.get("ts");
+        assert(entry.savedAt >= before && entry.savedAt <= after, "savedAt 应在 set 调用时间范围内");
+    });
+    it("相同哈希应覆盖旧记录", () => {
+        const store = new MockHashStore();
+        store.set("dup", { filename: "old.jpg" });
+        store.set("dup", { filename: "new.jpg" });
+        assertEqual(store.get("dup").filename, "new.jpg");
+        assertEqual(store.size, 1);
+    });
+});
+
+// ---- 基于内容哈希的重复检测流程 ----
+describe("基于内容哈希的重复检测流程", () => {
+    it("相同哈希 + skip 模式应跳过", () => {
+        const store = new MockHashStore();
+        store.set("hash_a", { filename: "saved.jpg" });
+        const dupAction = "skip";
+        const hash = "hash_a";
         // 模拟保存流程
+        if (store.has(hash) && dupAction === "skip") {
+            // 应跳过
+            assert(true, "应跳过重复图片");
+        } else {
+            assert(false, "不应到达这里");
+        }
+    });
+    it("相同哈希 + latest 模式应继续下载", () => {
+        const store = new MockHashStore();
+        store.set("hash_b", { filename: "old.jpg" });
+        const dupAction = "latest";
+        const hash = "hash_b";
+        let shouldDownload = true;
+        if (store.has(hash) && dupAction === "skip") {
+            shouldDownload = false;
+        }
+        assert(shouldDownload, "latest 模式应继续下载");
+    });
+    it("新哈希应正常下载并记录", () => {
+        const store = new MockHashStore();
+        const hash = "new_hash";
+        assert(!store.has(hash), "新哈希不应存在");
+        // 模拟下载成功后记录
+        store.set(hash, { filename: "new_file.jpg", url: "https://example.com/new.jpg" });
+        assert(store.has(hash), "下载后应记录哈希");
+    });
+    it("应统计跳过的重复图片数量（哈希模式）", () => {
+        const store = new MockHashStore();
+        const imageHashes = ["h1", "h2", "h1", "h3", "h2"]; // h1, h2 各重复一次
         const results = [];
-        for (const img of images) {
-            if (savedUrls.has(img.url)) {
+        for (const hash of imageHashes) {
+            if (store.has(hash)) {
                 results.push({ status: "skipped-dup" });
                 continue;
             }
-            savedUrls.set(img.url, "file.jpg");
+            store.set(hash, { filename: hash + ".jpg" });
             results.push({ status: "success" });
         }
         const dupCount = results.filter(r => r.status === "skipped-dup").length;
         assertEqual(dupCount, 2, "应有 2 张重复图片被跳过");
         const successCount = results.filter(r => r.status === "success").length;
         assertEqual(successCount, 3, "应有 3 张图片成功保存");
+    });
+    it("不同 URL 但相同内容哈希应被判定为重复", () => {
+        const store = new MockHashStore();
+        // 两个不同 URL 但内容相同（哈希相同）
+        const hash = "same_content_hash";
+        store.set(hash, { filename: "first.jpg", url: "https://cdn1.example.com/img.jpg" });
+        assert(store.has(hash), "相同哈希应被检测为重复，即使 URL 不同");
     });
 });
 
@@ -702,24 +849,50 @@ describe("健壮性", () => {
 
 // ---- 快捷键事件模拟 ----
 describe("快捷键事件模拟", () => {
-    it("e.code === 'KeyI' 应匹配，不受键盘布局影响", () => {
-        const mockEvent = { code: "KeyI", keyCode: 73, ctrlKey: true, altKey: true, shiftKey: false, metaKey: false, isComposing: false };
-        assert(mockEvent.code === "KeyI" || mockEvent.keyCode === 73, "应通过 code 或 keyCode 匹配");
-        assert(!mockEvent.isComposing, "不应在输入法编辑状态");
+    // 与主脚本一致的匹配逻辑
+    function matchesHotkey(e) {
+        if (e.isComposing) return false;
+        if (!e.ctrlKey || !e.altKey || e.shiftKey || e.metaKey) return false;
+        return e.code === "KeyI" || e.key === "i" || e.key === "I" || e.keyCode === 73;
+    }
+
+    it("e.code === 'KeyI' 应匹配", () => {
+        assert(matchesHotkey({ code: "KeyI", key: "i", keyCode: 73, ctrlKey: true, altKey: true, shiftKey: false, metaKey: false, isComposing: false }));
     });
-    it("输入法编辑状态应被忽略", () => {
-        const mockEvent = { code: "KeyI", ctrlKey: true, altKey: true, isComposing: true };
-        assert(mockEvent.isComposing, "isComposing 应为 true");
-        // 此时快捷键不应触发
+    it("e.key === 'i'（小写）应匹配", () => {
+        assert(matchesHotkey({ code: "", key: "i", keyCode: 0, ctrlKey: true, altKey: true, shiftKey: false, metaKey: false, isComposing: false }));
+    });
+    it("e.key === 'I'（大写）应匹配", () => {
+        assert(matchesHotkey({ code: "", key: "I", keyCode: 0, ctrlKey: true, altKey: true, shiftKey: false, metaKey: false, isComposing: false }));
     });
     it("e.keyCode === 73 应作为降级匹配", () => {
-        const mockEvent = { code: "", keyCode: 73, ctrlKey: true, altKey: true, shiftKey: false, metaKey: false, isComposing: false };
-        assert(mockEvent.code === "KeyI" || mockEvent.keyCode === 73, "应通过 keyCode 降级匹配");
+        assert(matchesHotkey({ code: "", key: "", keyCode: 73, ctrlKey: true, altKey: true, shiftKey: false, metaKey: false, isComposing: false }));
+    });
+    it("输入法编辑状态应被忽略", () => {
+        assert(!matchesHotkey({ code: "KeyI", key: "i", keyCode: 73, ctrlKey: true, altKey: true, shiftKey: false, metaKey: false, isComposing: true }));
     });
     it("不应响应含 Shift 的组合键", () => {
-        const mockEvent = { code: "KeyI", ctrlKey: true, altKey: true, shiftKey: true, metaKey: false };
-        const shouldHandle = mockEvent.ctrlKey && mockEvent.altKey && !mockEvent.shiftKey && !mockEvent.metaKey;
-        assert(!shouldHandle, "含 Shift 时不应响应");
+        assert(!matchesHotkey({ code: "KeyI", key: "i", keyCode: 73, ctrlKey: true, altKey: true, shiftKey: true, metaKey: false, isComposing: false }));
+    });
+    it("不应响应含 Meta 的组合键", () => {
+        assert(!matchesHotkey({ code: "KeyI", key: "i", keyCode: 73, ctrlKey: true, altKey: true, shiftKey: false, metaKey: true, isComposing: false }));
+    });
+    it("仅 Ctrl 不应触发（缺少 Alt）", () => {
+        assert(!matchesHotkey({ code: "KeyI", key: "i", keyCode: 73, ctrlKey: true, altKey: false, shiftKey: false, metaKey: false, isComposing: false }));
+    });
+    it("仅 Alt 不应触发（缺少 Ctrl）", () => {
+        assert(!matchesHotkey({ code: "KeyI", key: "i", keyCode: 73, ctrlKey: false, altKey: true, shiftKey: false, metaKey: false, isComposing: false }));
+    });
+    it("去重逻辑：100ms 内不应多次触发", () => {
+        let lastFired = 0;
+        let count = 0;
+        for (let i = 0; i < 3; i++) {
+            const now = Date.now();
+            if (now - lastFired < 100) continue;
+            lastFired = now;
+            count++;
+        }
+        assertEqual(count, 1, "瞬时连续调用只应触发 1 次");
     });
 });
 

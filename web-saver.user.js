@@ -1,4 +1,4 @@
-// ==UserScript==
+﻿// ==UserScript==
 // @name         Web Saver
 // @namespace    http://tampermonkey.net/
 // @version      2026-02-22
@@ -12,6 +12,9 @@
 // @grant        GM_notification
 // @grant        GM_registerMenuCommand
 // @grant        GM_addStyle
+// @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
+// @connect      *
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
@@ -20,7 +23,7 @@
     "use strict";
 
     // =====================================================================
-    // 日志 —— 始终显示在 DevTools 控制台
+    // 日志
     // =====================================================================
     const LOG_PREFIX = "[Web Saver]";
     const log = (...a) => console.log(LOG_PREFIX, ...a);
@@ -34,16 +37,17 @@
     // =====================================================================
     const SCRIPT_NAME = "Web Saver";
     const SETTINGS_KEY = "web_saver_settings";
+    const HASH_STORE_KEY = "ws_hash_store";
+    const HASH_STORE_MAX = 5000;           // 哈希存储最大条目数
     const MIN_IMAGE_SIZE_DEFAULT = 50;
 
     const VALID_IMAGE_EXTS = [
         "jpg", "jpeg", "png", "gif", "webp", "svg", "bmp", "tiff", "avif", "ico",
     ];
-
     const OUTPUT_FORMATS = ["original", "png", "jpg", "webp"];
 
     // =====================================================================
-    // GM_* API 安全封装（不可用时优雅降级）
+    // GM_* API 安全封装
     // =====================================================================
     function gmGetValue(key, defaultVal) {
         try { return GM_getValue(key, defaultVal); } catch (_) { }
@@ -59,21 +63,14 @@
     }
 
     function gmAddStyle(css) {
-        try {
-            if (typeof GM_addStyle === "function") { GM_addStyle(css); return; }
-        } catch (_) { }
-        // 降级：注入 <style> 元素
-        const style = document.createElement("style");
-        style.textContent = css;
-        (document.head || document.documentElement).appendChild(style);
+        try { if (typeof GM_addStyle === "function") { GM_addStyle(css); return; } } catch (_) { }
+        const s = document.createElement("style");
+        s.textContent = css;
+        (document.head || document.documentElement).appendChild(s);
     }
 
     function gmRegisterMenuCommand(label, fn) {
-        try {
-            if (typeof GM_registerMenuCommand === "function") {
-                GM_registerMenuCommand(label, fn);
-            }
-        } catch (_) { }
+        try { if (typeof GM_registerMenuCommand === "function") GM_registerMenuCommand(label, fn); } catch (_) { }
     }
 
     function gmDownload(opts) {
@@ -81,6 +78,34 @@
             try { GM_download(opts); return true; } catch (_) { }
         }
         return false;
+    }
+
+    /** 通过 GM_xmlhttpRequest 获取图片二进制数据（可跨域） */
+    function gmFetchBinary(url) {
+        return new Promise((resolve, reject) => {
+            if (typeof GM_xmlhttpRequest === "function") {
+                GM_xmlhttpRequest({
+                    method: "GET",
+                    url,
+                    responseType: "arraybuffer",
+                    onload: (resp) => {
+                        if (resp.status >= 200 && resp.status < 400) {
+                            resolve(resp.response);
+                        } else {
+                            reject(new Error("HTTP " + resp.status));
+                        }
+                    },
+                    onerror: (e) => reject(new Error(e?.error || "请求失败")),
+                    ontimeout: () => reject(new Error("请求超时")),
+                });
+            } else {
+                // 降级：使用 fetch（受 CORS 限制）
+                fetch(url).then(r => {
+                    if (!r.ok) throw new Error("HTTP " + r.status);
+                    return r.arrayBuffer();
+                }).then(resolve).catch(reject);
+            }
+        });
     }
 
     // =====================================================================
@@ -91,9 +116,9 @@
     function getExtFromUrl(url) {
         try {
             const pathname = new URL(url, window.location.href).pathname;
-            const match = pathname.match(/\.([a-zA-Z0-9]+)(?:[?#]|$)/);
-            if (match) {
-                let ext = match[1].toLowerCase();
+            const m = pathname.match(/\.([a-zA-Z0-9]+)(?:[?#]|$)/);
+            if (m) {
+                let ext = m[1].toLowerCase();
                 if (ext === "jpeg") ext = "jpg";
                 if (VALID_IMAGE_EXTS.includes(ext)) return ext;
             }
@@ -101,7 +126,7 @@
         return "jpg";
     }
 
-    /** 清理文件名中的非法字符（仅作用于文件名，不可用于路径） */
+    /** 清理文件名中的非法字符（仅用于文件名，不可用于路径） */
     function sanitizeFilename(name) {
         return name.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").trim();
     }
@@ -124,19 +149,118 @@
         return p;
     }
 
+    /**
+     * 计算二进制数据的内容哈希（cyrb53 算法，53 位精度）
+     * 返回 base36 字符串
+     */
+    function computeHash(buffer) {
+        const view = new Uint8Array(buffer);
+        const len = view.length;
+        let h1 = 0xdeadbeef ^ len;
+        let h2 = 0x41c6ce57 ^ len;
+        for (let i = 0; i < len; i++) {
+            h1 = Math.imul(h1 ^ view[i], 2654435761);
+            h2 = Math.imul(h2 ^ view[i], 1597334677);
+        }
+        h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507);
+        h1 ^= Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+        h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507);
+        h2 ^= Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+        return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+    }
+
+    /** 获取图片的内容哈希。如获取失败，降级为 URL 哈希。 */
+    async function computeImageHash(url) {
+        try {
+            const buffer = await gmFetchBinary(url);
+            const hash = computeHash(buffer);
+            log("图片哈希:", hash, "←", url.substring(0, 80));
+            return hash;
+        } catch (e) {
+            warn("无法获取图片计算哈希，降级为 URL 哈希:", e.message);
+            // URL 的简单哈希作为降级
+            let h = 0;
+            for (let i = 0; i < url.length; i++) {
+                h = Math.imul(31, h) + url.charCodeAt(i) | 0;
+            }
+            return "url-" + (h >>> 0).toString(36);
+        }
+    }
+
+    // =====================================================================
+    // 哈希存储（持久化，跨会话）
+    // =====================================================================
+    class HashStore {
+        constructor() {
+            this._store = {};
+            this.load();
+        }
+
+        load() {
+            try {
+                const raw = gmGetValue(HASH_STORE_KEY, null);
+                if (raw) {
+                    this._store = typeof raw === "string" ? JSON.parse(raw) : raw;
+                }
+            } catch (e) {
+                warn("加载哈希存储失败:", e);
+                this._store = {};
+            }
+        }
+
+        save() {
+            gmSetValue(HASH_STORE_KEY, JSON.stringify(this._store));
+        }
+
+        has(hash) {
+            return hash in this._store;
+        }
+
+        get(hash) {
+            return this._store[hash] || null;
+        }
+
+        set(hash, info) {
+            this._store[hash] = { ...info, savedAt: Date.now() };
+            this._prune();
+            this.save();
+        }
+
+        /** 超过上限时删除最旧的条目 */
+        _prune() {
+            const keys = Object.keys(this._store);
+            if (keys.length <= HASH_STORE_MAX) return;
+            const sorted = keys.sort((a, b) =>
+                (this._store[a].savedAt || 0) - (this._store[b].savedAt || 0)
+            );
+            const toRemove = sorted.slice(0, keys.length - HASH_STORE_MAX);
+            for (const k of toRemove) delete this._store[k];
+        }
+
+        get size() {
+            return Object.keys(this._store).length;
+        }
+
+        clear() {
+            this._store = {};
+            this.save();
+            log("哈希存储已清空");
+        }
+    }
+
     // =====================================================================
     // 设置
     // =====================================================================
     class Settings {
         static DEFAULTS = {
-            saveMode: "single",      // 'single' | 'multiple'
-            sortBy: "size",         // 'size' | 'time'
-            imageFormat: "original",     // 'original' | 'png' | 'jpg' | 'webp'
+            saveMode: "single",
+            sortBy: "size",
+            imageFormat: "original",
             nameTemplate: "{yyyy}-{mm}-{dd}-{hh}{MM}{ss}",
-            defaultSavePath: "",            // 浏览器下载目录下的子文件夹
-            domainPaths: {},            // { hostname: path }
-            conflictAction: "uniquify",    // uniquify | overwrite | skip | prompt
-            duplicateAction: "skip",        // 'skip' | 'latest' —— 同一 URL 图片的处理方式
+            defaultSavePath: "",
+            domainPaths: {},
+            conflictAction: "uniquify",
+            duplicateAction: "skip",        // 'skip' | 'latest'
             minImageSize: MIN_IMAGE_SIZE_DEFAULT,
             firstRun: true,
         };
@@ -160,14 +284,8 @@
         }
 
         save() { gmSetValue(SETTINGS_KEY, JSON.stringify(this._data)); }
-
         get(key) { return this._data[key]; }
-
-        set(key, value) {
-            this._data[key] = value;
-            this.save();
-        }
-
+        set(key, value) { this._data[key] = value; this.save(); }
         getAll() { return { ...this._data }; }
 
         setAll(obj) {
@@ -175,19 +293,10 @@
             this.save();
         }
 
-        /** 获取当前域名对应的保存路径（已规范化） */
         getSavePath() {
             const domain = window.location.hostname;
-            const domainPaths = this._data.domainPaths || {};
-            const raw = domainPaths[domain] || this._data.defaultSavePath || "";
-            return normalizePath(raw);
-        }
-
-        setDomainPath(domain, path) {
-            if (!this._data.domainPaths) this._data.domainPaths = {};
-            if (path) { this._data.domainPaths[domain] = path; }
-            else { delete this._data.domainPaths[domain]; }
-            this.save();
+            const dp = this._data.domainPaths || {};
+            return normalizePath(dp[domain] || this._data.defaultSavePath || "");
         }
 
         reset() {
@@ -202,16 +311,14 @@
     class FileNamer {
         constructor(settings) { this.settings = settings; }
 
-        /** 根据模板生成文件名 */
         generate(context = {}) {
             const template = this.settings.get("nameTemplate");
             const now = new Date();
-            const domain = window.location.hostname;
             const title = sanitizeFilename(document.title).substring(0, 100);
 
             const map = {
                 "{title}": title,
-                "{domain}": domain,
+                "{domain}": window.location.hostname,
                 "{url}": sanitizeFilename(window.location.href).substring(0, 200),
                 "{yyyy}": String(now.getFullYear()),
                 "{mm}": padZero(now.getMonth() + 1),
@@ -227,12 +334,9 @@
             for (const [ph, val] of Object.entries(map)) {
                 filename = filename.replaceAll(ph, val);
             }
-
-            // 模板中没有 {ext} 则自动追加扩展名
             if (!template.includes("{ext}")) {
                 filename += "." + (context.ext || "jpg");
             }
-
             return sanitizeFilename(filename);
         }
     }
@@ -243,63 +347,45 @@
     class ImageCollector {
         constructor(settings) { this.settings = settings; }
 
-        /** 扫描页面中的所有图片源 */
         collect() {
             const images = [];
             const seen = new Set();
             const minSize = this.settings.get("minImageSize") || MIN_IMAGE_SIZE_DEFAULT;
 
-            // 1. <img> 元素（含 <picture> 的 currentSrc）
+            // 1. <img> 元素
             document.querySelectorAll("img").forEach((img, idx) => {
                 const url = img.currentSrc || img.src;
                 if (!url || seen.has(url)) return;
                 if (url.startsWith("data:") && url.length < 200) return;
-
                 const w = img.naturalWidth || img.width;
                 const h = img.naturalHeight || img.height;
                 if (w < minSize && h < minSize) return;
-
                 seen.add(url);
-                images.push({
-                    url, width: w, height: h, area: w * h,
-                    element: img, domIndex: idx, type: "img",
-                });
+                images.push({ url, width: w, height: h, area: w * h, element: img, domIndex: idx, type: "img" });
             });
 
-            // 2. 懒加载图片（data-src / data-original / data-lazy-src）
-            document.querySelectorAll(
-                "img[data-src], img[data-original], img[data-lazy-src]"
-            ).forEach((img, idx) => {
+            // 2. 懒加载图片
+            document.querySelectorAll("img[data-src], img[data-original], img[data-lazy-src]").forEach((img, idx) => {
                 const url = img.dataset.src || img.dataset.original || img.dataset.lazySrc;
                 if (!url || seen.has(url)) return;
                 seen.add(url);
-                images.push({
-                    url,
-                    width: img.naturalWidth || img.width || 0,
-                    height: img.naturalHeight || img.height || 0,
-                    area: (img.naturalWidth || img.width || 0) * (img.naturalHeight || img.height || 0),
-                    element: img, domIndex: 100000 + idx, type: "lazy",
-                });
+                const w = img.naturalWidth || img.width || 0;
+                const h = img.naturalHeight || img.height || 0;
+                images.push({ url, width: w, height: h, area: w * h, element: img, domIndex: 100000 + idx, type: "lazy" });
             });
 
-            // 3. CSS 背景图片（页面元素不超过 5000 个时才扫描，避免性能问题）
+            // 3. CSS 背景图片
             const allEls = document.querySelectorAll("*");
             if (allEls.length < 5000) {
                 allEls.forEach((el, idx) => {
                     try {
                         const bg = getComputedStyle(el).backgroundImage;
                         if (!bg || bg === "none") return;
-                        const matches = bg.matchAll(/url\(["']?(.+?)["']?\)/g);
-                        for (const m of matches) {
+                        for (const m of bg.matchAll(/url\(["']?(.+?)["']?\)/g)) {
                             const url = m[1];
                             if (!url || seen.has(url) || url.startsWith("data:")) continue;
                             seen.add(url);
-                            images.push({
-                                url,
-                                width: el.offsetWidth, height: el.offsetHeight,
-                                area: el.offsetWidth * el.offsetHeight,
-                                element: el, domIndex: 200000 + idx, type: "bg",
-                            });
+                            images.push({ url, width: el.offsetWidth, height: el.offsetHeight, area: el.offsetWidth * el.offsetHeight, element: el, domIndex: 200000 + idx, type: "bg" });
                         }
                     } catch (_) { }
                 });
@@ -310,29 +396,21 @@
                 const url = video.poster;
                 if (!url || seen.has(url)) return;
                 seen.add(url);
-                images.push({
-                    url,
-                    width: video.videoWidth || video.offsetWidth,
-                    height: video.videoHeight || video.offsetHeight,
-                    area: (video.videoWidth || video.offsetWidth) * (video.videoHeight || video.offsetHeight),
-                    element: video, domIndex: 300000 + idx, type: "poster",
-                });
+                const w = video.videoWidth || video.offsetWidth;
+                const h = video.videoHeight || video.offsetHeight;
+                images.push({ url, width: w, height: h, area: w * h, element: video, domIndex: 300000 + idx, type: "poster" });
             });
 
             log(`收集到 ${images.length} 张图片`);
             return images;
         }
 
-        /** 按设置排序图片 */
         sort(images) {
             const sortBy = this.settings.get("sortBy");
-            if (sortBy === "size") {
-                return [...images].sort((a, b) => b.area - a.area);
-            }
+            if (sortBy === "size") return [...images].sort((a, b) => b.area - a.area);
             return [...images].sort((a, b) => a.domIndex - b.domIndex);
         }
 
-        /** 根据保存模式选择图片 */
         select(images) {
             const sorted = this.sort(images);
             if (this.settings.get("saveMode") === "single") {
@@ -346,35 +424,39 @@
     // 图片保存
     // =====================================================================
     class ImageSaver {
-        constructor(settings, fileNamer) {
+        constructor(settings, fileNamer, hashStore) {
             this.settings = settings;
             this.fileNamer = fileNamer;
+            this.hashStore = hashStore;
             this._sessionNames = new Set();
-            this._savedUrls = new Map();   // url → 已保存文件名（用于去重）
         }
 
-        /** 保存图片列表，返回结果数组 */
         async save(images) {
             const results = [];
-            const savePath = this.settings.getSavePath();   // 已规范化
+            const savePath = this.settings.getSavePath();
             const conflictAction = this.settings.get("conflictAction");
-            const duplicateAction = this.settings.get("duplicateAction") || "skip";
+            const dupAction = this.settings.get("duplicateAction") || "skip";
             const format = this.settings.get("imageFormat");
 
             for (let i = 0; i < images.length; i++) {
                 const image = images[i];
 
-                // —— 重复 URL 检测 ——
-                if (this._savedUrls.has(image.url)) {
-                    if (duplicateAction === "skip") {
-                        log("重复图片已跳过:", image.url);
-                        results.push({
-                            filename: this._savedUrls.get(image.url),
-                            status: "skipped-dup",
-                        });
+                // —— 基于内容哈希的重复检测 ——
+                let hash = null;
+                try {
+                    hash = await computeImageHash(image.url);
+                } catch (e) {
+                    warn("哈希计算失败:", e.message);
+                }
+
+                if (hash && this.hashStore.has(hash)) {
+                    const prev = this.hashStore.get(hash);
+                    if (dupAction === "skip") {
+                        log("重复图片已跳过 (哈希匹配):", hash, "→", prev.filename);
+                        results.push({ filename: prev.filename, status: "skipped-dup" });
                         continue;
                     }
-                    // 'latest' → 继续下载（覆盖）
+                    // 'latest' → 继续下载
                 }
 
                 let ext = getExtFromUrl(image.url);
@@ -382,35 +464,30 @@
 
                 let filename = this.fileNamer.generate({ index: i + 1, ext });
 
-                // 会话级文件名去重
                 if (conflictAction === "uniquify") {
                     filename = this._uniquify(filename);
                 }
 
-                // 拼合路径（savePath 末尾已有 / 或为空）
                 const fullPath = savePath + filename;
 
-                // 会话内已保存过则跳过
                 if (conflictAction === "skip" && this._sessionNames.has(fullPath)) {
                     results.push({ filename: fullPath, status: "skipped" });
                     continue;
                 }
 
                 let downloadUrl = image.url;
-
-                // 格式转换（通过 canvas）
                 if (format !== "original") {
-                    try {
-                        downloadUrl = await this._convertImage(image.url, format);
-                    } catch (e) {
-                        warn("格式转换失败，使用原格式:", e);
-                    }
+                    try { downloadUrl = await this._convertImage(image.url, format); }
+                    catch (e) { warn("格式转换失败，使用原格式:", e); }
                 }
 
                 try {
                     await this._download(downloadUrl, fullPath, conflictAction);
                     this._sessionNames.add(fullPath);
-                    this._savedUrls.set(image.url, fullPath);
+                    // 持久化哈希记录
+                    if (hash) {
+                        this.hashStore.set(hash, { filename: fullPath, url: image.url });
+                    }
                     results.push({ filename: fullPath, status: "success" });
                     log("已保存:", fullPath);
                 } catch (e) {
@@ -421,34 +498,28 @@
             return results;
         }
 
-        /** 在会话内对文件名去重（加 -1、-2 后缀） */
         _uniquify(filename) {
             if (!this._sessionNames.has(filename)) return filename;
-            const dotIdx = filename.lastIndexOf(".");
-            const base = dotIdx > 0 ? filename.slice(0, dotIdx) : filename;
-            const ext = dotIdx > 0 ? filename.slice(dotIdx) : "";
+            const dot = filename.lastIndexOf(".");
+            const base = dot > 0 ? filename.slice(0, dot) : filename;
+            const ext = dot > 0 ? filename.slice(dot) : "";
             let n = 1;
             while (this._sessionNames.has(`${base}-${n}${ext}`)) n++;
             return `${base}-${n}${ext}`;
         }
 
-        /** 下载文件：优先 GM_download，降级为 <a> 点击 */
         _download(url, name, conflictAction) {
-            log("下载参数: name =", name);
+            log("下载:", name);
             return new Promise((resolve, reject) => {
                 const gmAction = conflictAction === "skip" ? "uniquify" : conflictAction;
-                const success = gmDownload({
-                    url,
-                    name,
-                    conflictAction: gmAction,
+                const ok = gmDownload({
+                    url, name, conflictAction: gmAction,
                     onload: () => resolve(),
-                    onerror: (err) => reject(new Error(err?.error || err?.details || "下载失败")),
+                    onerror: (e) => reject(new Error(e?.error || e?.details || "下载失败")),
                     ontimeout: () => reject(new Error("下载超时")),
                 });
-
-                if (!success) {
-                    // 降级：不可见 <a> 标签点击下载
-                    log("GM_download 不可用，使用备用下载方式");
+                if (!ok) {
+                    log("GM_download 不可用，使用 <a> 降级");
                     try {
                         const a = document.createElement("a");
                         a.href = url;
@@ -462,7 +533,6 @@
             });
         }
 
-        /** 通过 canvas 进行格式转换 */
         _convertImage(url, format) {
             return new Promise((resolve, reject) => {
                 const img = new Image();
@@ -470,246 +540,257 @@
                 img.onload = () => {
                     try {
                         const c = document.createElement("canvas");
-                        c.width = img.naturalWidth;
-                        c.height = img.naturalHeight;
+                        c.width = img.naturalWidth; c.height = img.naturalHeight;
                         c.getContext("2d").drawImage(img, 0, 0);
-                        const mime = `image/${format === "jpg" ? "jpeg" : format}`;
-                        resolve(c.toDataURL(mime, 0.95));
+                        resolve(c.toDataURL(`image/${format === "jpg" ? "jpeg" : format}`, 0.95));
                     } catch (e) { reject(e); }
                 };
-                img.onerror = () => reject(new Error("无法加载图片进行格式转换"));
+                img.onerror = () => reject(new Error("图片加载失败"));
                 img.src = url;
             });
         }
     }
 
     // =====================================================================
-    // 样式（所有 UI 样式集中管理）
-    // =====================================================================
-    const CSS = `
-        /* —— 提示条 Toast —— */
-        .ws-toast-container {
-            position: fixed; bottom: 80px; right: 20px;
-            z-index: 2147483647;
-            display: flex; flex-direction: column-reverse; gap: 8px;
-            pointer-events: none;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-        }
-        .ws-toast {
-            background: #323232; color: #fff;
-            padding: 10px 18px; border-radius: 8px;
-            font-size: 13px; line-height: 1.4;
-            box-shadow: 0 4px 12px rgba(0,0,0,.3);
-            animation: ws-slide-in .25s ease-out;
-            pointer-events: auto; max-width: 360px; word-break: break-word;
-        }
-        .ws-toast.ws-success { border-left: 4px solid #4CAF50; }
-        .ws-toast.ws-error   { border-left: 4px solid #f44336; }
-        .ws-toast.ws-info    { border-left: 4px solid #2196F3; }
-        @keyframes ws-slide-in {
-            from { transform: translateX(100%); opacity: 0; }
-            to   { transform: translateX(0);    opacity: 1; }
-        }
-
-        /* —— 图片高亮 —— */
-        .ws-img-highlight {
-            outline: 3px solid #4CAF50 !important;
-            outline-offset: 2px;
-            box-shadow: 0 0 12px rgba(76,175,80,.5);
-            transition: outline .3s, box-shadow .3s;
-        }
-
-        /* —— 右下角浮动按钮组 —— */
-        .ws-fab-container {
-            position: fixed; bottom: 20px; right: 20px;
-            z-index: 2147483645;
-            display: flex; flex-direction: column;
-            align-items: flex-end; gap: 8px;
-            pointer-events: none;
-        }
-        .ws-fab-container > * { pointer-events: auto; }
-
-        .ws-fab-buttons {
-            display: flex; gap: 8px;
-        }
-        .ws-fab {
-            width: 42px; height: 42px;
-            border-radius: 50%;
-            background: #4CAF50; color: #fff;
-            border: none; cursor: pointer;
-            box-shadow: 0 2px 8px rgba(0,0,0,.3);
-            font-size: 20px; line-height: 42px; text-align: center;
-            transition: transform .2s, box-shadow .2s, opacity .3s;
-            opacity: 0.55; user-select: none;
-        }
-        .ws-fab:hover {
-            transform: scale(1.1);
-            box-shadow: 0 4px 16px rgba(0,0,0,.4);
-            opacity: 1;
-        }
-        .ws-fab-settings { background: #607D8B; font-size: 18px; }
-
-        /* —— 缩略图预览面板 —— */
-        .ws-preview-panel {
-            background: #fff; border-radius: 10px;
-            box-shadow: 0 4px 20px rgba(0,0,0,.2);
-            padding: 10px;
-            display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px;
-            max-width: 300px; max-height: 340px; overflow-y: auto;
-            opacity: 0; transform: translateY(8px);
-            transition: opacity .2s, transform .2s;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-        }
-        .ws-preview-panel.ws-visible {
-            opacity: 1; transform: translateY(0);
-        }
-        .ws-preview-thumb {
-            width: 84px; height: 84px;
-            object-fit: cover; border-radius: 6px;
-            border: 2px solid #e0e0e0;
-            transition: border-color .15s;
-            background: #f5f5f5;
-        }
-        .ws-preview-thumb.ws-selected {
-            border-color: #4CAF50;
-            box-shadow: 0 0 6px rgba(76,175,80,.4);
-        }
-        .ws-preview-info {
-            grid-column: 1 / -1;
-            text-align: center; font-size: 12px; color: #888;
-            padding: 4px 0 0; margin: 0;
-        }
-
-        @keyframes ws-fade-in {
-            from { opacity: 0; transform: translateY(8px); }
-            to   { opacity: 1; transform: translateY(0); }
-        }
-
-        /* —— 设置面板 —— */
-        .ws-overlay {
-            position: fixed; inset: 0;
-            background: rgba(0,0,0,.45);
-            z-index: 2147483646;
-            display: flex; align-items: center; justify-content: center;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-        }
-        .ws-panel {
-            background: #fff; border-radius: 12px;
-            width: 480px; max-height: 90vh; overflow-y: auto;
-            box-shadow: 0 8px 30px rgba(0,0,0,.25);
-            padding: 24px 28px; color: #222;
-        }
-        .ws-panel h2 {
-            margin: 0 0 18px; font-size: 18px; font-weight: 600;
-            display: flex; align-items: center; gap: 8px;
-        }
-        .ws-panel label {
-            display: block; font-size: 13px; font-weight: 500;
-            margin: 14px 0 4px; color: #555;
-        }
-        .ws-panel input[type="text"],
-        .ws-panel input[type="number"],
-        .ws-panel select {
-            width: 100%; padding: 7px 10px;
-            border: 1px solid #d0d0d0; border-radius: 6px;
-            font-size: 13px; box-sizing: border-box;
-            outline: none; transition: border-color .2s;
-        }
-        .ws-panel input:focus, .ws-panel select:focus { border-color: #4CAF50; }
-        .ws-panel .ws-radio-group {
-            display: flex; gap: 14px; margin: 4px 0;
-            font-size: 13px; flex-wrap: wrap;
-        }
-        .ws-panel .ws-radio-group label {
-            display: inline-flex; align-items: center; gap: 4px;
-            font-weight: 400; color: #333; margin: 0; cursor: pointer;
-        }
-        .ws-panel .ws-hint {
-            font-size: 11px; color: #999; margin: 2px 0 0;
-        }
-        .ws-panel .ws-actions {
-            display: flex; justify-content: flex-end; gap: 10px;
-            margin-top: 22px; padding-top: 14px; border-top: 1px solid #eee;
-        }
-        .ws-panel button {
-            padding: 7px 18px; border: none; border-radius: 6px;
-            font-size: 13px; cursor: pointer; font-weight: 500;
-            transition: background .15s;
-        }
-        .ws-panel .ws-btn-primary   { background: #4CAF50; color: #fff; }
-        .ws-panel .ws-btn-primary:hover { background: #43A047; }
-        .ws-panel .ws-btn-secondary { background: #e0e0e0; color: #333; }
-        .ws-panel .ws-btn-secondary:hover { background: #d0d0d0; }
-        .ws-panel .ws-btn-danger    { background: transparent; color: #f44336; margin-right: auto; }
-        .ws-panel .ws-btn-danger:hover { background: #ffebee; }
-    `;
-
-    // =====================================================================
-    // UI 管理器
+    // UI 管理器 —— 使用 Shadow DOM 隔离确保在任何页面上都能正确显示
     // =====================================================================
     class UIManager {
-        constructor(settings) {
+        constructor(settings, hashStore) {
             this.settings = settings;
-            this._panelEl = null;
+            this.hashStore = hashStore;
+            this._settingsBtn = null;
+            this._saveBtn = null;
             this._toastContainer = null;
-            this._fabContainer = null;
+            this._panelEl = null;
+            this._onSave = null;
+            this._onCollect = null;
             this._previewEl = null;
             this._previewTimer = null;
-            this._onSave = null;   // 保存回调
-            this._onCollect = null;   // 收集图片回调（用于预览）
+            this._highlightStyleInjected = false;
+            this._host = null;
+            this._shadow = null;
         }
 
-        /** 初始化 UI（注入样式 + 创建浮动按钮） */
         init() {
-            this._injectStyles();
+            this._ensureHost();
+            this._injectGlobalCSS();
+            this._createToastContainer();
             this._createFab();
-            log("UI 已初始化");
+            log("UI 已初始化 (Shadow DOM)");
         }
 
-        _injectStyles() { gmAddStyle(CSS); }
+        /**
+         * 用 !important 设置内联样式，作为 Shadow DOM 之外的额外防御层。
+         */
+        _s(el, styles) {
+            for (const [prop, val] of Object.entries(styles)) {
+                el.style.setProperty(prop, val, 'important');
+            }
+        }
 
-        // ---- 浮动按钮组（右下角） ----
+        /** 创建 Shadow DOM 宿主元素，提供完全的样式隔离 */
+        _ensureHost() {
+            if (this._host && this._host.isConnected) return;
+
+            const host = document.createElement('ws-root');
+            host.setAttribute('style', [
+                'all: initial',
+                'position: fixed',
+                'top: 0',
+                'left: 0',
+                'width: 0',
+                'height: 0',
+                'overflow: visible',
+                'pointer-events: none',
+                'z-index: 2147483646',
+            ].map(s => s + ' !important').join('; ') + ';');
+
+            let shadow;
+            try {
+                shadow = host.attachShadow({ mode: 'closed' });
+            } catch (e) {
+                warn("Shadow DOM 不可用，使用降级方案:", e);
+                shadow = host;
+            }
+            this._shadow = shadow;
+
+            // 将 keyframe 动画注入 Shadow Root（页面 CSS 无法影响）
+            const style = document.createElement('style');
+            style.textContent = `
+                @keyframes ws-toast-slide-in {
+                    from { transform: translateX(100%); opacity: 0; }
+                    to   { transform: translateX(0);    opacity: 1; }
+                }
+            `;
+            this._shadow.appendChild(style);
+
+            // 挂载到 DOM（优先 body，降级到 documentElement）
+            this._mountHost(host);
+            this._host = host;
+
+            // 监视移除并自动重新附加（应对 SPA 页面替换 body 内容）
+            this._watchHost();
+        }
+
+        /** 挂载宿主元素到 DOM */
+        _mountHost(host) {
+            const target = document.body || document.documentElement;
+            try {
+                target.appendChild(host);
+            } catch (e) {
+                error("无法挂载 UI 容器:", e);
+            }
+        }
+
+        /** 监视宿主元素是否被页面脚本移除，如被移除则重新附加 */
+        _watchHost() {
+            try {
+                const observer = new MutationObserver(() => {
+                    if (this._host && !this._host.isConnected) {
+                        log("UI 容器被移除，正在重新附加...");
+                        this._mountHost(this._host);
+                    }
+                });
+                observer.observe(document.documentElement, { childList: true, subtree: true });
+            } catch (e) {
+                warn("MutationObserver 不可用:", e);
+            }
+        }
+
+        /** 注入页面级 CSS（仅图片高亮样式，需作用于页面 DOM 元素） */
+        _injectGlobalCSS() {
+            gmAddStyle(`
+                .ws-img-highlight {
+                    outline: 3px solid #4CAF50 !important;
+                    outline-offset: 2px;
+                    box-shadow: 0 0 12px rgba(76,175,80,.5) !important;
+                    transition: outline .3s, box-shadow .3s;
+                }
+            `);
+            this._highlightStyleInjected = true;
+        }
+
+        // ---- Toast 容器 ----
+        _createToastContainer() {
+            const c = document.createElement("div");
+            this._s(c, {
+                'position': 'fixed',
+                'bottom': '80px',
+                'right': '20px',
+                'display': 'flex',
+                'flex-direction': 'column-reverse',
+                'gap': '8px',
+                'pointer-events': 'none',
+                'z-index': '2147483646',
+                'font-family': '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+                'box-sizing': 'border-box',
+                'margin': '0',
+                'padding': '0',
+            });
+            this._shadow.appendChild(c);
+            this._toastContainer = c;
+        }
+
+        // ---- FAB 浮动按钮 ----
         _createFab() {
-            const container = document.createElement("div");
-            container.className = "ws-fab-container";
+            const FAB_BASE = {
+                'position': 'fixed',
+                'width': '44px',
+                'height': '44px',
+                'border-radius': '50%',
+                'border': 'none',
+                'cursor': 'pointer',
+                'box-shadow': '0 2px 8px rgba(0,0,0,.3)',
+                'z-index': '2147483646',
+                'display': 'flex',
+                'align-items': 'center',
+                'justify-content': 'center',
+                'user-select': 'none',
+                'pointer-events': 'auto',
+                'transition': 'transform .2s, box-shadow .2s, opacity .3s',
+                'font-family': '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+                'padding': '0',
+                'margin': '0',
+                'box-sizing': 'border-box',
+                'outline': 'none',
+                'overflow': 'visible',
+                'opacity': '0.6',
+                'color': '#fff',
+                'line-height': '44px',
+                'text-align': 'center',
+                'visibility': 'visible',
+                'background-image': 'none',
+                'min-width': '0',
+                'min-height': '0',
+                'text-decoration': 'none',
+                'text-transform': 'none',
+                'letter-spacing': 'normal',
+                'text-indent': '0',
+                'text-shadow': 'none',
+                'float': 'none',
+                'clear': 'none',
+            };
+            const HOVER_ON = {
+                'transform': 'scale(1.12)',
+                'opacity': '1',
+                'box-shadow': '0 4px 16px rgba(0,0,0,.4)',
+            };
+            const HOVER_OFF = {
+                'transform': 'scale(1)',
+                'opacity': '0.6',
+                'box-shadow': '0 2px 8px rgba(0,0,0,.3)',
+            };
 
-            const btnRow = document.createElement("div");
-            btnRow.className = "ws-fab-buttons";
-
-            // 设置按钮
-            const settingsBtn = document.createElement("button");
-            settingsBtn.className = "ws-fab ws-fab-settings";
-            settingsBtn.textContent = "⚙";
-            settingsBtn.title = "打开设置 (Ctrl+Alt+O)";
-            settingsBtn.addEventListener("click", (e) => {
+            // ⚙ 设置按钮
+            const sBtn = document.createElement("button");
+            this._s(sBtn, {
+                ...FAB_BASE,
+                'bottom': '20px',
+                'right': '72px',
+                'background': '#607D8B',
+                'background-color': '#607D8B',
+                'font-size': '18px',
+            });
+            sBtn.textContent = "⚙";
+            sBtn.title = "打开设置 (Ctrl+Alt+O)";
+            sBtn.addEventListener("mouseenter", () => this._s(sBtn, HOVER_ON));
+            sBtn.addEventListener("mouseleave", () => this._s(sBtn, HOVER_OFF));
+            sBtn.addEventListener("click", (e) => {
                 e.stopPropagation();
                 this.showSettings();
             });
+            this._shadow.appendChild(sBtn);
+            this._settingsBtn = sBtn;
 
-            // 保存按钮
+            // 📷 保存按钮
             const saveBtn = document.createElement("button");
-            saveBtn.className = "ws-fab";
+            this._s(saveBtn, {
+                ...FAB_BASE,
+                'bottom': '20px',
+                'right': '20px',
+                'background': '#4CAF50',
+                'background-color': '#4CAF50',
+                'font-size': '20px',
+            });
             saveBtn.textContent = "📷";
             saveBtn.title = "保存图片 (Ctrl+Alt+I)";
+            saveBtn.addEventListener("mouseenter", () => {
+                this._s(saveBtn, HOVER_ON);
+                this._previewTimer = setTimeout(() => this._showPreview(), 300);
+            });
+            saveBtn.addEventListener("mouseleave", () => {
+                this._s(saveBtn, HOVER_OFF);
+                clearTimeout(this._previewTimer);
+                this._hidePreview();
+            });
             saveBtn.addEventListener("click", (e) => {
                 e.stopPropagation();
                 if (this._onSave) this._onSave();
             });
+            this._shadow.appendChild(saveBtn);
+            this._saveBtn = saveBtn;
 
-            // 悬浮预览
-            saveBtn.addEventListener("mouseenter", () => {
-                this._previewTimer = setTimeout(() => this._showPreview(), 300);
-            });
-            saveBtn.addEventListener("mouseleave", () => {
-                clearTimeout(this._previewTimer);
-                this._hidePreview();
-            });
-
-            btnRow.appendChild(settingsBtn);
-            btnRow.appendChild(saveBtn);
-            container.appendChild(btnRow);
-            document.body.appendChild(container);
-            this._fabContainer = container;
+            log("FAB 按钮已创建并添加到页面");
         }
 
         // ---- 缩略图预览 ----
@@ -718,46 +799,79 @@
             const allImages = this._onCollect ? this._onCollect() : [];
             if (allImages.length === 0) return;
 
-            // 取要保存的子集（用于高亮）
             const isSingle = this.settings.get("saveMode") === "single";
             const selectedUrls = new Set(
                 isSingle ? [allImages[0]?.url] : allImages.map(img => img.url)
             );
 
             const panel = document.createElement("div");
-            panel.className = "ws-preview-panel";
+            this._s(panel, {
+                'position': 'fixed',
+                'bottom': '74px',
+                'right': '20px',
+                'background': '#fff',
+                'border-radius': '10px',
+                'box-shadow': '0 4px 20px rgba(0,0,0,.2)',
+                'padding': '10px',
+                'display': 'grid',
+                'grid-template-columns': 'repeat(3, 1fr)',
+                'gap': '6px',
+                'max-width': '300px',
+                'max-height': '340px',
+                'overflow-y': 'auto',
+                'pointer-events': 'auto',
+                'opacity': '0',
+                'transform': 'translateY(8px)',
+                'transition': 'opacity .2s, transform .2s',
+                'z-index': '2147483646',
+                'font-family': '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+                'box-sizing': 'border-box',
+                'margin': '0',
+            });
 
             const maxShow = 9;
-            const toShow = allImages.slice(0, maxShow);
-
-            toShow.forEach((img) => {
+            allImages.slice(0, maxShow).forEach((img) => {
                 const thumb = document.createElement("img");
                 thumb.src = img.url;
-                thumb.className = "ws-preview-thumb";
-                if (selectedUrls.has(img.url)) {
-                    thumb.classList.add("ws-selected");
-                }
+                const isSel = selectedUrls.has(img.url);
+                this._s(thumb, {
+                    'width': '84px',
+                    'height': '84px',
+                    'object-fit': 'cover',
+                    'border-radius': '6px',
+                    'border': isSel ? '2px solid #4CAF50' : '2px solid #e0e0e0',
+                    'background': '#f5f5f5',
+                    'box-shadow': isSel ? '0 0 6px rgba(76,175,80,.4)' : 'none',
+                    'box-sizing': 'border-box',
+                    'display': 'block',
+                });
                 thumb.title = `${img.width || "?"}×${img.height || "?"} ${img.type}`;
                 thumb.loading = "lazy";
-                thumb.onerror = () => { thumb.style.display = "none"; };
+                thumb.onerror = () => {
+                    thumb.style.setProperty('display', 'none', 'important');
+                };
                 panel.appendChild(thumb);
             });
 
-            // 信息行
             const info = document.createElement("div");
-            info.className = "ws-preview-info";
+            this._s(info, {
+                'grid-column': '1 / -1',
+                'text-align': 'center',
+                'font-size': '12px',
+                'color': '#888',
+                'padding': '4px 0 0',
+            });
             const willSave = isSingle ? 1 : allImages.length;
             info.textContent = allImages.length > maxShow
                 ? `显示前 ${maxShow} 张，共 ${allImages.length} 张 · 将保存 ${willSave} 张`
                 : `共 ${allImages.length} 张图片 · 将保存 ${willSave} 张`;
             panel.appendChild(info);
 
-            // 插入到按钮行上方
-            this._fabContainer.insertBefore(panel, this._fabContainer.firstChild);
+            this._shadow.appendChild(panel);
             this._previewEl = panel;
-            // 触发重排后添加可见类以启动动画
+            // 强制 reflow 后触发 transition
             void panel.offsetHeight;
-            panel.classList.add("ws-visible");
+            this._s(panel, { 'opacity': '1', 'transform': 'translateY(0)' });
         }
 
         _hidePreview() {
@@ -767,43 +881,68 @@
             }
         }
 
-        /** 设置"保存"回调 */
         setSaveHandler(fn) { this._onSave = fn; }
-        /** 设置"收集图片"回调（用于预览） */
         setCollectHandler(fn) { this._onCollect = fn; }
 
-        // ---- 提示条 Toast ----
-        _ensureToastContainer() {
-            if (!this._toastContainer || !this._toastContainer.isConnected) {
-                this._toastContainer = document.createElement("div");
-                this._toastContainer.className = "ws-toast-container";
-                document.body.appendChild(this._toastContainer);
-            }
-            return this._toastContainer;
-        }
-
+        // ---- Toast ----
         toast(message, type = "info", duration = 3000) {
             log(`[toast:${type}]`, message);
-            const container = this._ensureToastContainer();
+            if (!this._toastContainer) {
+                warn("toast 容器未初始化，跳过显示");
+                return;
+            }
+            const borderColors = {
+                success: '#4CAF50',
+                error: '#f44336',
+                info: '#2196F3',
+            };
             const el = document.createElement("div");
-            el.className = `ws-toast ws-${type}`;
+            this._s(el, {
+                'background': '#323232',
+                'color': '#fff',
+                'padding': '10px 18px',
+                'border-radius': '8px',
+                'font-size': '13px',
+                'line-height': '1.4',
+                'box-shadow': '0 4px 12px rgba(0,0,0,.3)',
+                'pointer-events': 'auto',
+                'max-width': '360px',
+                'word-break': 'break-word',
+                'border-left': `4px solid ${borderColors[type] || borderColors.info}`,
+                'animation': 'ws-toast-slide-in .25s ease-out',
+                'font-family': '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+                'margin': '0',
+                'box-sizing': 'border-box',
+                'visibility': 'visible',
+                'opacity': '1',
+                'display': 'block',
+            });
             el.textContent = message;
-            container.appendChild(el);
+            this._toastContainer.appendChild(el);
             setTimeout(() => {
-                el.style.opacity = "0";
-                el.style.transition = "opacity .3s";
+                el.style.setProperty('opacity', '0', 'important');
+                el.style.setProperty('transition', 'opacity .3s', 'important');
                 setTimeout(() => el.remove(), 300);
             }, duration);
         }
 
         // ---- 图片高亮 ----
         highlightImages(images, duration = 1200) {
+            if (!this._highlightStyleInjected) {
+                gmAddStyle(`
+                    .ws-img-highlight {
+                        outline: 3px solid #4CAF50 !important;
+                        outline-offset: 2px;
+                        box-shadow: 0 0 12px rgba(76,175,80,.5) !important;
+                        transition: outline .3s, box-shadow .3s;
+                    }
+                `);
+                this._highlightStyleInjected = true;
+            }
             for (const img of images) {
                 if (img.element) {
                     img.element.classList.add("ws-img-highlight");
-                    setTimeout(() => {
-                        img.element.classList.remove("ws-img-highlight");
-                    }, duration);
+                    setTimeout(() => img.element.classList.remove("ws-img-highlight"), duration);
                 }
             }
         }
@@ -816,74 +955,181 @@
             const domain = window.location.hostname;
             const domainPath = (data.domainPaths || {})[domain] || "";
 
+            // 全屏遮罩层
             const overlay = document.createElement("div");
-            overlay.className = "ws-overlay";
-            overlay.innerHTML = `
-                <div class="ws-panel">
-                    <h2><span>⚙</span> ${SCRIPT_NAME} 设置</h2>
+            this._s(overlay, {
+                'position': 'fixed',
+                'inset': '0',
+                'background': 'rgba(0,0,0,.45)',
+                'display': 'flex',
+                'align-items': 'center',
+                'justify-content': 'center',
+                'z-index': '2147483647',
+                'pointer-events': 'auto',
+                'font-family': '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+                'margin': '0',
+                'padding': '0',
+                'box-sizing': 'border-box',
+            });
 
-                    <label>保存模式</label>
-                    <div class="ws-radio-group">
-                        <label><input type="radio" name="ws-saveMode" value="single" ${data.saveMode === "single" ? "checked" : ""}> 单张图片</label>
-                        <label><input type="radio" name="ws-saveMode" value="multiple" ${data.saveMode === "multiple" ? "checked" : ""}> 所有图片</label>
-                    </div>
+            // 面板容器
+            const panel = document.createElement("div");
+            const panelId = "ws-settings-" + Date.now();
+            panel.id = panelId;
+            this._s(panel, {
+                'background': '#fff',
+                'border-radius': '12px',
+                'width': '480px',
+                'max-height': '90vh',
+                'overflow-y': 'auto',
+                'box-shadow': '0 8px 30px rgba(0,0,0,.25)',
+                'padding': '24px 28px',
+                'color': '#222',
+                'font-family': '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+                'box-sizing': 'border-box',
+                'text-align': 'left',
+                'font-size': '13px',
+                'line-height': '1.5',
+                'pointer-events': 'auto',
+            });
 
-                    <label>排序方式</label>
-                    <div class="ws-radio-group">
-                        <label><input type="radio" name="ws-sortBy" value="size" ${data.sortBy === "size" ? "checked" : ""}> 尺寸（从大到小）</label>
-                        <label><input type="radio" name="ws-sortBy" value="time" ${data.sortBy === "time" ? "checked" : ""}> 页面顺序</label>
-                    </div>
+            // 面板内部样式（通过 <style> 标签，以面板 ID 作用域隔离）
+            const styleTag = document.createElement("style");
+            styleTag.textContent = `
+                #${panelId} * {
+                    box-sizing: border-box !important;
+                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+                }
+                #${panelId} h2 {
+                    margin: 0 0 18px !important; font-size: 18px !important; font-weight: 600 !important;
+                    display: flex !important; align-items: center !important; gap: 8px !important;
+                    color: #222 !important; line-height: 1.4 !important; padding: 0 !important;
+                    border: none !important; background: transparent !important;
+                }
+                #${panelId} label {
+                    display: block !important; font-size: 13px !important; font-weight: 500 !important;
+                    margin: 14px 0 4px !important; color: #555 !important; padding: 0 !important;
+                }
+                #${panelId} input[type="text"],
+                #${panelId} input[type="number"],
+                #${panelId} select {
+                    width: 100% !important; padding: 7px 10px !important;
+                    border: 1px solid #d0d0d0 !important; border-radius: 6px !important;
+                    font-size: 13px !important; box-sizing: border-box !important;
+                    outline: none !important; background: #fff !important; color: #222 !important;
+                    margin: 0 !important; height: auto !important; line-height: 1.4 !important;
+                    appearance: auto !important; -webkit-appearance: auto !important;
+                }
+                #${panelId} input:focus, #${panelId} select:focus {
+                    border-color: #4CAF50 !important;
+                }
+                #${panelId} .ws-radio-group {
+                    display: flex !important; gap: 14px !important; margin: 4px 0 !important;
+                    font-size: 13px !important; flex-wrap: wrap !important; padding: 0 !important;
+                }
+                #${panelId} .ws-radio-group label {
+                    display: inline-flex !important; align-items: center !important; gap: 4px !important;
+                    font-weight: 400 !important; color: #333 !important; margin: 0 !important;
+                    cursor: pointer !important; font-size: 13px !important;
+                }
+                #${panelId} .ws-radio-group input[type="radio"] {
+                    width: auto !important; height: auto !important; margin: 0 !important;
+                    padding: 0 !important; border: initial !important; appearance: auto !important;
+                    -webkit-appearance: auto !important;
+                }
+                #${panelId} .ws-hint {
+                    font-size: 11px !important; color: #999 !important; margin: 2px 0 0 !important;
+                    padding: 0 !important;
+                }
+                #${panelId} .ws-actions {
+                    display: flex !important; justify-content: flex-end !important; gap: 10px !important;
+                    margin-top: 22px !important; padding-top: 14px !important;
+                    border-top: 1px solid #eee !important; flex-wrap: wrap !important;
+                }
+                #${panelId} button {
+                    padding: 7px 18px !important; border: none !important; border-radius: 6px !important;
+                    font-size: 13px !important; cursor: pointer !important; font-weight: 500 !important;
+                    line-height: 1.4 !important; display: inline-block !important;
+                    text-align: center !important; text-decoration: none !important;
+                    height: auto !important; width: auto !important; margin: 0 !important;
+                }
+                #${panelId} .ws-btn-primary   { background: #4CAF50 !important; color: #fff !important; }
+                #${panelId} .ws-btn-primary:hover { background: #43A047 !important; }
+                #${panelId} .ws-btn-secondary { background: #e0e0e0 !important; color: #333 !important; }
+                #${panelId} .ws-btn-secondary:hover { background: #d0d0d0 !important; }
+                #${panelId} .ws-btn-danger    { background: transparent !important; color: #f44336 !important; margin-right: auto !important; }
+                #${panelId} .ws-btn-danger:hover { background: #ffebee !important; }
+                #${panelId} .ws-btn-warning   { background: #FF9800 !important; color: #fff !important; }
+                #${panelId} .ws-btn-warning:hover { background: #F57C00 !important; }
+            `;
+            overlay.appendChild(styleTag);
 
-                    <label>图片格式</label>
-                    <select id="ws-imageFormat">
-                        ${OUTPUT_FORMATS.map(f => `<option value="${f}" ${data.imageFormat === f ? "selected" : ""}>${f === "original" ? "原始格式" : f.toUpperCase()}</option>`).join("")}
-                    </select>
+            panel.innerHTML = `
+                <h2><span>⚙</span> ${SCRIPT_NAME} 设置</h2>
 
-                    <label>命名模板</label>
-                    <input type="text" id="ws-nameTemplate" value="${data.nameTemplate}">
-                    <div class="ws-hint">占位符: {title} {domain} {url} {yyyy} {mm} {dd} {hh} {MM} {ss} {index} {ext}</div>
+                <label>保存模式</label>
+                <div class="ws-radio-group">
+                    <label><input type="radio" name="ws-saveMode" value="single" ${data.saveMode === "single" ? "checked" : ""}> 单张图片</label>
+                    <label><input type="radio" name="ws-saveMode" value="multiple" ${data.saveMode === "multiple" ? "checked" : ""}> 所有图片</label>
+                </div>
 
-                    <label>默认保存路径</label>
-                    <input type="text" id="ws-defaultSavePath" value="${data.defaultSavePath}" placeholder="例如: artworks/arts">
-                    <div class="ws-hint">路径相对于浏览器下载目录。如需保存到指定位置，请在浏览器设置中更改下载目录。<br>在 Tampermonkey 设置 → 通用 → 配置模式 → 高级 → 下载(Beta) → 模式 → 选择「浏览器 API」可支持子目录。</div>
+                <label>排序方式</label>
+                <div class="ws-radio-group">
+                    <label><input type="radio" name="ws-sortBy" value="size" ${data.sortBy === "size" ? "checked" : ""}> 尺寸（从大到小）</label>
+                    <label><input type="radio" name="ws-sortBy" value="time" ${data.sortBy === "time" ? "checked" : ""}> 页面顺序</label>
+                </div>
 
-                    <label>当前域名 <b>${domain}</b> 的保存路径</label>
-                    <input type="text" id="ws-domainPath" value="${domainPath}" placeholder="留空则使用默认路径">
+                <label>图片格式</label>
+                <select id="ws-imageFormat">
+                    ${OUTPUT_FORMATS.map(f => `<option value="${f}" ${data.imageFormat === f ? "selected" : ""}>${f === "original" ? "原始格式" : f.toUpperCase()}</option>`).join("")}
+                </select>
 
-                    <label>文件冲突处理</label>
-                    <div class="ws-radio-group">
-                        <label><input type="radio" name="ws-conflict" value="uniquify" ${data.conflictAction === "uniquify" ? "checked" : ""}> 添加编号</label>
-                        <label><input type="radio" name="ws-conflict" value="overwrite" ${data.conflictAction === "overwrite" ? "checked" : ""}> 覆盖</label>
-                        <label><input type="radio" name="ws-conflict" value="skip" ${data.conflictAction === "skip" ? "checked" : ""}> 跳过</label>
-                        <label><input type="radio" name="ws-conflict" value="prompt" ${data.conflictAction === "prompt" ? "checked" : ""}> 询问</label>
-                    </div>
+                <label>命名模板</label>
+                <input type="text" id="ws-nameTemplate" value="${data.nameTemplate}">
+                <div class="ws-hint">占位符: {title} {domain} {url} {yyyy} {mm} {dd} {hh} {MM} {ss} {index} {ext}</div>
 
-                    <label>重复图片处理（相同 URL）</label>
-                    <div class="ws-radio-group">
-                        <label><input type="radio" name="ws-dupAction" value="skip" ${(data.duplicateAction || "skip") === "skip" ? "checked" : ""}> 跳过（不重复下载）</label>
-                        <label><input type="radio" name="ws-dupAction" value="latest" ${data.duplicateAction === "latest" ? "checked" : ""}> 重新下载</label>
-                    </div>
+                <label>默认保存路径</label>
+                <input type="text" id="ws-defaultSavePath" value="${data.defaultSavePath}" placeholder="例如: artworks/arts">
+                <div class="ws-hint">路径相对于浏览器下载目录。Tampermonkey 设置 → 高级 → 下载(Beta) → 浏览器 API 可支持子目录。</div>
 
-                    <label>最小图片尺寸（像素）</label>
-                    <input type="number" id="ws-minImageSize" value="${data.minImageSize}" min="0" max="1000" style="width:100px;">
+                <label>当前域名 <b>${domain}</b> 的保存路径</label>
+                <input type="text" id="ws-domainPath" value="${domainPath}" placeholder="留空则使用默认路径">
 
-                    <div class="ws-actions">
-                        <button class="ws-btn-danger" id="ws-btn-reset">重置</button>
-                        <button class="ws-btn-secondary" id="ws-btn-cancel">取消</button>
-                        <button class="ws-btn-primary" id="ws-btn-save">保存</button>
-                    </div>
+                <label>文件冲突处理</label>
+                <div class="ws-radio-group">
+                    <label><input type="radio" name="ws-conflict" value="uniquify" ${data.conflictAction === "uniquify" ? "checked" : ""}> 添加编号</label>
+                    <label><input type="radio" name="ws-conflict" value="overwrite" ${data.conflictAction === "overwrite" ? "checked" : ""}> 覆盖</label>
+                    <label><input type="radio" name="ws-conflict" value="skip" ${data.conflictAction === "skip" ? "checked" : ""}> 跳过</label>
+                    <label><input type="radio" name="ws-conflict" value="prompt" ${data.conflictAction === "prompt" ? "checked" : ""}> 询问</label>
+                </div>
+
+                <label>重复图片处理（基于内容哈希）</label>
+                <div class="ws-radio-group">
+                    <label><input type="radio" name="ws-dupAction" value="skip" ${(data.duplicateAction || "skip") === "skip" ? "checked" : ""}> 跳过（不重复下载）</label>
+                    <label><input type="radio" name="ws-dupAction" value="latest" ${data.duplicateAction === "latest" ? "checked" : ""}> 重新下载</label>
+                </div>
+                <div class="ws-hint">已记录 ${this.hashStore.size} 张图片的下载历史</div>
+
+                <label>最小图片尺寸（像素）</label>
+                <input type="number" id="ws-minImageSize" value="${data.minImageSize}" min="0" max="1000" style="width:100px !important;">
+
+                <div class="ws-actions">
+                    <button class="ws-btn-danger" id="ws-btn-reset">重置设置</button>
+                    <button class="ws-btn-warning" id="ws-btn-clear-history">清除下载历史</button>
+                    <button class="ws-btn-secondary" id="ws-btn-cancel">取消</button>
+                    <button class="ws-btn-primary" id="ws-btn-save">保存</button>
                 </div>
             `;
 
-            document.body.appendChild(overlay);
+            overlay.appendChild(panel);
+            this._shadow.appendChild(overlay);
             this._panelEl = overlay;
 
-            // 点击遮罩关闭
+            // ---- 事件绑定 ----
             overlay.addEventListener("click", (e) => {
                 if (e.target === overlay) this.hideSettings();
             });
 
-            // Escape 关闭
             const escHandler = (e) => {
                 if (e.key === "Escape") {
                     this.hideSettings();
@@ -892,12 +1138,9 @@
             };
             document.addEventListener("keydown", escHandler, true);
 
-            // 取消
-            overlay.querySelector("#ws-btn-cancel").addEventListener("click",
-                () => this.hideSettings());
+            panel.querySelector("#ws-btn-cancel").addEventListener("click", () => this.hideSettings());
 
-            // 重置
-            overlay.querySelector("#ws-btn-reset").addEventListener("click", () => {
+            panel.querySelector("#ws-btn-reset").addEventListener("click", () => {
                 if (confirm("确定重置所有设置为默认值？")) {
                     this.settings.reset();
                     this.hideSettings();
@@ -905,23 +1148,34 @@
                 }
             });
 
-            // 保存
-            overlay.querySelector("#ws-btn-save").addEventListener("click", () => {
+            panel.querySelector("#ws-btn-clear-history").addEventListener("click", () => {
+                if (confirm(`确定清除下载历史？（共 ${this.hashStore.size} 条记录）\n清除后，之前下载过的图片将被重新下载。`)) {
+                    this.hashStore.clear();
+                    this.toast("下载历史已清除", "info");
+                    const hints = panel.querySelectorAll(".ws-hint");
+                    hints.forEach(h => {
+                        if (h.textContent.includes("已记录")) {
+                            h.textContent = "已记录 0 张图片的下载历史";
+                        }
+                    });
+                }
+            });
+
+            panel.querySelector("#ws-btn-save").addEventListener("click", () => {
                 const newData = {
-                    saveMode: overlay.querySelector('input[name="ws-saveMode"]:checked')?.value || "single",
-                    sortBy: overlay.querySelector('input[name="ws-sortBy"]:checked')?.value || "size",
-                    imageFormat: overlay.querySelector("#ws-imageFormat").value,
-                    nameTemplate: overlay.querySelector("#ws-nameTemplate").value || Settings.DEFAULTS.nameTemplate,
-                    defaultSavePath: overlay.querySelector("#ws-defaultSavePath").value.trim(),
-                    conflictAction: overlay.querySelector('input[name="ws-conflict"]:checked')?.value || "uniquify",
-                    duplicateAction: overlay.querySelector('input[name="ws-dupAction"]:checked')?.value || "skip",
-                    minImageSize: parseInt(overlay.querySelector("#ws-minImageSize").value, 10) || MIN_IMAGE_SIZE_DEFAULT,
+                    saveMode: panel.querySelector('input[name="ws-saveMode"]:checked')?.value || "single",
+                    sortBy: panel.querySelector('input[name="ws-sortBy"]:checked')?.value || "size",
+                    imageFormat: panel.querySelector("#ws-imageFormat").value,
+                    nameTemplate: panel.querySelector("#ws-nameTemplate").value || Settings.DEFAULTS.nameTemplate,
+                    defaultSavePath: panel.querySelector("#ws-defaultSavePath").value.trim(),
+                    conflictAction: panel.querySelector('input[name="ws-conflict"]:checked')?.value || "uniquify",
+                    duplicateAction: panel.querySelector('input[name="ws-dupAction"]:checked')?.value || "skip",
+                    minImageSize: parseInt(panel.querySelector("#ws-minImageSize").value, 10) || MIN_IMAGE_SIZE_DEFAULT,
                     firstRun: false,
                 };
 
-                // 保留已有 domainPaths，更新当前域名
                 const domainPaths = { ...(this.settings.get("domainPaths") || {}) };
-                const dp = overlay.querySelector("#ws-domainPath").value.trim();
+                const dp = panel.querySelector("#ws-domainPath").value.trim();
                 if (dp) { domainPaths[domain] = dp; }
                 else { delete domainPaths[domain]; }
                 newData.domainPaths = domainPaths;
@@ -951,10 +1205,7 @@
         constructor() {
             log("正在初始化...");
 
-            // 1. 设置
-            try {
-                this.settings = new Settings();
-            } catch (e) {
+            try { this.settings = new Settings(); } catch (e) {
                 error("设置初始化失败:", e);
                 this.settings = {
                     _data: {}, get: (k) => Settings.DEFAULTS[k],
@@ -963,82 +1214,94 @@
                 };
             }
 
-            // 2. 核心模块
+            this.hashStore = new HashStore();
             this.fileNamer = new FileNamer(this.settings);
             this.collector = new ImageCollector(this.settings);
-            this.saver = new ImageSaver(this.settings, this.fileNamer);
-            this.ui = new UIManager(this.settings);
+            this.saver = new ImageSaver(this.settings, this.fileNamer, this.hashStore);
+            this.ui = new UIManager(this.settings, this.hashStore);
 
-            // 3. UI 初始化（隔离错误）
             try { this.ui.init(); } catch (e) { error("UI 初始化失败:", e); }
 
-            // 4. 回调绑定
             this.ui.setSaveHandler(() => this.saveImages());
             this.ui.setCollectHandler(() => {
                 const all = this.collector.collect();
                 return this.collector.select(all);
             });
 
-            // 5. 快捷键 & 菜单
             this._bindHotkeys();
             this._registerMenu();
             this._checkFirstRun();
 
-            log("初始化完成。按 Ctrl+Alt+I 保存图片。");
+            log("初始化完成。按 Ctrl+Alt+I 保存图片，或点击右下角 📷 按钮。");
         }
 
-        /** 绑定快捷键 */
+        /** 绑定快捷键 —— 简洁且健壮 */
         _bindHotkeys() {
-            // 同时在 document 和 window 上注册捕获阶段监听，最大化兼容性
-            const handler = (e) => {
-                // 忽略输入法编辑状态
+            const self = this;
+            let lastFired = 0; // 时间戳去重，防止 document/window 双触发
+
+            function handler(e) {
+                // 跳过输入法编辑状态
                 if (e.isComposing) return;
-                if (!e.ctrlKey || !e.altKey) return;
-                if (e.shiftKey || e.metaKey) return;
+                // 必须同时按下 Ctrl + Alt，不能有 Shift 或 Meta
+                if (!e.ctrlKey || !e.altKey || e.shiftKey || e.metaKey) return;
 
-                // 使用 e.code（不受键盘布局和输入法影响）+ e.keyCode 兜底
-                if (e.code === "KeyI" || e.keyCode === 73) {
+                // 调试日志：帮助诊断快捷键问题
+                log("检测到 Ctrl+Alt 按键:", JSON.stringify({
+                    code: e.code, key: e.key, keyCode: e.keyCode,
+                    type: e.type, target: e.target?.tagName
+                }));
+
+                // 时间戳去重（100ms 内只触发一次）
+                const now = Date.now();
+                if (now - lastFired < 100) return;
+
+                // 匹配 I 键：code → key → keyCode（三重兜底）
+                const isI = e.code === "KeyI" || e.key === "i" || e.key === "I" || e.keyCode === 73;
+                const isO = e.code === "KeyO" || e.key === "o" || e.key === "O" || e.keyCode === 79;
+
+                if (isI) {
+                    lastFired = now;
                     e.preventDefault();
                     e.stopImmediatePropagation();
-                    log("快捷键 Ctrl+Alt+I 触发");
-                    this.saveImages();
-                } else if (e.code === "KeyO" || e.keyCode === 79) {
+                    log("快捷键 Ctrl+Alt+I 触发 → 保存图片");
+                    self.saveImages();
+                } else if (isO) {
+                    lastFired = now;
                     e.preventDefault();
                     e.stopImmediatePropagation();
-                    log("快捷键 Ctrl+Alt+O 触发（设置）");
-                    this.ui.showSettings();
+                    log("快捷键 Ctrl+Alt+O 触发 → 设置");
+                    self.ui.showSettings();
                 }
-            };
+            }
 
+            // 在多个目标上注册捕获阶段监听，最大化兼容性
             document.addEventListener("keydown", handler, true);
-            window.addEventListener("keydown", handler, true);
 
-            // 防止重复触发的标志
-            let _fired = false;
-            const safeHandler = (e) => {
-                if (_fired) return;
-                _fired = true;
-                handler(e);
-                setTimeout(() => { _fired = false; }, 50);
-            };
+            try {
+                // window 在有些环境中是沙箱对象，尝试注册
+                if (window !== document) {
+                    window.addEventListener("keydown", handler, true);
+                }
+            } catch (_) { }
 
-            // 替换为安全版本
-            document.removeEventListener("keydown", handler, true);
-            window.removeEventListener("keydown", handler, true);
-            document.addEventListener("keydown", safeHandler, true);
-            window.addEventListener("keydown", safeHandler, true);
+            try {
+                // 在 Tampermonkey 沙箱环境中，unsafeWindow 可能指向真实页面 window
+                if (typeof unsafeWindow !== "undefined" && unsafeWindow !== window) {
+                    unsafeWindow.addEventListener("keydown", handler, true);
+                    log("已在 unsafeWindow 上注册快捷键监听");
+                }
+            } catch (_) { }
 
             log("快捷键已绑定 (Ctrl+Alt+I = 保存, Ctrl+Alt+O = 设置)");
         }
 
-        /** 注册 Tampermonkey 菜单项 */
         _registerMenu() {
             gmRegisterMenuCommand("📷 保存图片", () => this.saveImages());
             gmRegisterMenuCommand("⚙ 设置", () => this.ui.showSettings());
             log("菜单命令已注册");
         }
 
-        /** 首次运行检测 */
         _checkFirstRun() {
             if (this.settings.get("firstRun")) {
                 log("首次运行 —— 显示欢迎信息");
@@ -1052,7 +1315,6 @@
             }
         }
 
-        /** 保存图片主流程 */
         async saveImages() {
             if (this.ui.isSettingsOpen()) return;
 
@@ -1072,22 +1334,11 @@
             log(`已选择 ${selected.length} 张图片`);
             this.ui.highlightImages(selected);
 
-            // —— 先检查是否全部为重复图片 ——
-            const duplicateAction = this.settings.get("duplicateAction") || "skip";
-            if (duplicateAction === "skip") {
-                const allDup = selected.every(img => this.saver._savedUrls.has(img.url));
-                if (allDup) {
-                    this.ui.toast(`⊘ 已跳过 ${selected.length} 张图片（重复，之前已保存过）`, "info", 3000);
-                    log("全部为重复图片，已跳过");
-                    return;
-                }
-            }
-
             const mode = this.settings.get("saveMode");
             this.ui.toast(
                 mode === "single"
-                    ? `正在保存图片 (${selected[0].width}×${selected[0].height})...`
-                    : `正在保存 ${selected.length} 张图片...`,
+                    ? `正在检查图片 (${selected[0].width}×${selected[0].height})...`
+                    : `正在检查 ${selected.length} 张图片...`,
                 "info", 2000
             );
 
@@ -1106,7 +1357,7 @@
             }
             if (skippedDup.length > 0) {
                 this.ui.toast(
-                    `⊘ 已跳过 ${skippedDup.length} 张重复图片`,
+                    `⊘ 已跳过 ${skippedDup.length} 张重复图片（内容相同）`,
                     "info", 3000
                 );
             }
@@ -1126,17 +1377,17 @@
     }
 
     // =====================================================================
-    // 初始化 —— 全局 try-catch 兜底
+    // 初始化
     // =====================================================================
     try {
-        const webSaver = new WebSaver();
+        new WebSaver();
     } catch (e) {
         error("初始化严重错误:", e);
         try {
             const div = document.createElement("div");
             div.style.cssText = "position:fixed;bottom:20px;right:20px;z-index:2147483647;"
                 + "background:#f44336;color:#fff;padding:12px 18px;border-radius:8px;"
-                + "font:13px sans-serif;box-shadow:0 4px 12px rgba(0,0,0,.3);";
+                + "font:13px sans-serif;box-shadow:0 4px 12px rgba(0,0,0,.3);pointer-events:auto;";
             div.textContent = `${SCRIPT_NAME}: 初始化错误 — 请按 F12 查看控制台`;
             document.body.appendChild(div);
             setTimeout(() => div.remove(), 8000);
