@@ -1,121 +1,141 @@
 # Web Saver
 
-A Tampermonkey userscript that automatically collects images from web pages and saves them with a single hotkey.
+网页图片一键收集保存工具 —— Tampermonkey 用户脚本。
 
-## Features
+## 功能特性
 
-- **One-key save** — Press `Ctrl+Alt+I` to instantly save the largest image on the page
-- **Floating button** — A 📷 button in the bottom-left corner provides quick access to save and settings
-- **Smart image collection** — Finds images from `<img>`, CSS background images, lazy-loaded `data-src`, and `<video poster>`
-- **Flexible sorting** — Sort by size (area, largest first) or DOM order
-- **Single or batch save** — Save just the biggest image, or all images at once
-- **Format conversion** — Save as original format, or convert to PNG / JPG / WebP
-- **Custom naming** — Template-based filenames with date, page title, domain, and index placeholders
-- **Per-domain save paths** — Configure different download subfolders for different websites
-- **Conflict handling** — Auto-increment, overwrite, skip, or prompt on filename collision
-- **Visual feedback** — Highlights selected images and shows toast notifications with console logging
-- **Settings panel** — Clean in-page UI (`Ctrl+Alt+O`) to configure all options; opens automatically on first install
-- **Robust initialization** — Graceful fallbacks when GM_* APIs aren't available; visible error reporting
+- **一键保存** — 按 `Ctrl+Alt+I` 立即保存页面最大的图片
+- **右下角浮动按钮** — 📷 保存按钮 + ⚙ 设置按钮，方便操作
+- **缩略图预览** — 鼠标悬停在 📷 按钮上，预览当前可保存的图片
+- **智能图片收集** — 支持 `<img>`、CSS 背景图、懒加载 `data-src`、`<video poster>`
+- **灵活排序** — 按尺寸（面积降序）或页面顺序排列
+- **单张/批量保存** — 仅保存最大图片，或保存所有图片
+- **格式转换** — 保留原格式，或转换为 PNG / JPG / WebP
+- **自定义命名** — 模板化文件名，支持日期、标题、域名、序号等占位符
+- **域名级保存路径** — 为不同网站配置不同的下载子目录
+- **文件冲突处理** — 自动编号 / 覆盖 / 跳过 / 询问
+- **重复图片检测** — 同一 URL 图片可跳过或重新下载
+- **视觉反馈** — 高亮选中图片，右下角 Toast 提示，控制台日志
+- **设置面板** — 按 `Ctrl+Alt+O` 打开设置界面，首次安装自动弹出
+- **健壮初始化** — GM_* API 不可用时自动降级，错误可见
 
-## Installation
+## 安装
 
-1. Install [Tampermonkey](https://www.tampermonkey.net/) in your browser.
-2. Create a new userscript and paste the contents of `web-saver.user.js`, **or** click the raw file link if hosted on a supported platform.
-3. Save and enable the script.
+1. 在浏览器中安装 [Tampermonkey](https://www.tampermonkey.net/)。
+2. 新建用户脚本，粘贴 `web-saver.user.js` 的内容；或直接点击 raw 链接安装。
+3. 保存并启用脚本。
 
-## Usage
+## 使用方法
 
-| Action            | Trigger                                  |
-|-------------------|------------------------------------------|
-| Save image(s)     | `Ctrl + Alt + I`                         |
-| Open settings     | `Ctrl + Alt + O` or 📷 button → Settings |
-| Save via button   | Click 📷 button → Save Image(s)          |
-| Save via menu     | Tampermonkey menu → **📷 Save Image(s)** |
-| Settings via menu | Tampermonkey menu → **⚙ Settings**       |
+| 操作       | 触发方式                             |
+|----------|--------------------------------------|
+| 保存图片   | `Ctrl + Alt + I`                     |
+| 打开设置   | `Ctrl + Alt + O` 或点击右下角 ⚙ 按钮 |
+| 按钮保存   | 点击右下角 📷 按钮                   |
+| 菜单保存   | Tampermonkey 菜单 → **📷 保存图片**  |
+| 菜单设置   | Tampermonkey 菜单 → **⚙ 设置**       |
+| 缩略图预览 | 鼠标悬停在 📷 按钮上                 |
 
-On first install the settings panel opens automatically so you can configure preferences.
+首次安装时设置面板会自动弹出，方便配置。
 
-## Configuration
+## 配置说明
 
-All settings are persisted via `GM_setValue` and survive page reloads / browser restarts.
+所有设置通过 `GM_setValue` 持久化，页面刷新和浏览器重启后保留。
 
-| Setting               | Default                         | Description                                                |
-|-----------------------|---------------------------------|------------------------------------------------------------|
-| **Save Mode**         | `single`                        | `single` saves the top-ranked image; `multiple` saves all  |
-| **Sort By**           | `size`                          | `size` = largest area first; `time` = DOM order            |
-| **Image Format**      | `original`                      | Keep original format, or convert to `png` / `jpg` / `webp` |
-| **Name Template**     | `{yyyy}-{mm}-{dd}-{hh}{MM}{ss}` | Filename pattern (see placeholders below)                  |
-| **Default Save Path** | *(empty)*                       | Subfolder under the browser downloads directory            |
-| **Domain Save Path**  | *(empty)*                       | Per-domain override for save path                          |
-| **Conflict Action**   | `uniquify`                      | `uniquify` / `overwrite` / `skip` / `prompt`               |
-| **Min Image Size**    | `50` px                         | Images smaller than this (w **and** h) are ignored         |
+| 设置项           | 默认值                          | 说明                                              |
+|---------------|---------------------------------|---------------------------------------------------|
+| **保存模式**     | `single`                        | `single` 保存排名最高的图片；`multiple` 保存全部   |
+| **排序方式**     | `size`                          | `size` = 面积最大优先；`time` = 页面顺序           |
+| **图片格式**     | `original`                      | 保留原格式，或转换为 `png` / `jpg` / `webp`        |
+| **命名模板**     | `{yyyy}-{mm}-{dd}-{hh}{MM}{ss}` | 文件名模板（见下方占位符表）                        |
+| **默认保存路径** | *(空)*                          | 浏览器下载目录下的子文件夹                        |
+| **域名保存路径** | *(空)*                          | 针对特定域名的路径覆盖                            |
+| **冲突处理**     | `uniquify`                      | `uniquify` / `overwrite` / `skip` / `prompt`      |
+| **重复图片**     | `skip`                          | `skip` = 跳过已下载的相同 URL；`latest` = 重新下载 |
+| **最小尺寸**     | `50` px                         | 宽和高均小于此值的图片将被忽略                    |
 
-## Name Template Placeholders
+## 命名模板占位符
 
-| Placeholder | Description                                  | Example                    |
-|-------------|----------------------------------------------|----------------------------|
-| `{title}`   | Page title (sanitized)                       | `My_Page_Title`            |
-| `{domain}`  | Hostname                                     | `example.com`              |
-| `{url}`     | Full URL (sanitized, truncated to 200 chars) | `https___example.com_page` |
-| `{yyyy}`    | 4-digit year                                 | `2026`                     |
-| `{mm}`      | 2-digit month                                | `02`                       |
-| `{dd}`      | 2-digit day                                  | `22`                       |
-| `{hh}`      | 2-digit hour (24h)                           | `14`                       |
-| `{MM}`      | 2-digit minute                               | `30`                       |
-| `{ss}`      | 2-digit second                               | `45`                       |
-| `{index}`   | Image index (1-based, useful in multi-save)  | `3`                        |
-| `{ext}`     | File extension                               | `jpg`                      |
+| 占位符     | 说明                      | 示例                       |
+|------------|-------------------------|----------------------------|
+| `{title}`  | 页面标题（已清理）          | `My_Page_Title`            |
+| `{domain}` | 域名                      | `example.com`              |
+| `{url}`    | 完整 URL（已清理，截断 200） | `https___example.com_page` |
+| `{yyyy}`   | 4 位年                    | `2026`                     |
+| `{mm}`     | 2 位月                    | `02`                       |
+| `{dd}`     | 2 位日                    | `22`                       |
+| `{hh}`     | 2 位时（24 小时制）         | `14`                       |
+| `{MM}`     | 2 位分                    | `30`                       |
+| `{ss}`     | 2 位秒                    | `45`                       |
+| `{index}`  | 图片序号（1 开始）          | `3`                        |
+| `{ext}`    | 文件扩展名                | `jpg`                      |
 
-> If `{ext}` is **not** included in the template, the extension is appended automatically (e.g. `2026-02-22-143045.jpg`).
+> 如果模板中未包含 `{ext}`，扩展名会自动追加到末尾（如 `2026-02-22-143045.jpg`）。
 
-## Conflict Handling
+## 文件冲突处理
 
-| Mode                        | Behaviour                                                                |
-|-----------------------------|--------------------------------------------------------------------------|
-| **Add number** (`uniquify`) | Appends `-1`, `-2`, … to the filename                                    |
-| **Overwrite**               | Replaces the existing file                                               |
-| **Skip**                    | Skips saving if a file with the same name was already saved this session |
-| **Prompt**                  | Lets the browser/Tampermonkey ask the user                               |
+| 模式                      | 行为                           |
+|-------------------------|------------------------------|
+| **添加编号** (`uniquify`) | 在文件名后追加 `-1`、`-2`、…     |
+| **覆盖**                  | 替换已有文件                   |
+| **跳过**                  | 会话内已保存过的同名文件将跳过 |
+| **询问**                  | 由浏览器/Tampermonkey 弹窗询问 |
 
-## Project Structure
+## 重复图片处理
+
+同一会话中多次遇到相同 URL 的图片时：
+
+| 模式         | 行为                  |
+|------------|---------------------|
+| **跳过**     | 不重复下载，提示已跳过 |
+| **重新下载** | 重新下载并保存        |
+
+## 保存路径说明
+
+- **默认保存路径** 和 **域名保存路径** 是相对于浏览器下载目录的子文件夹路径。
+- 反斜杠 `\` 会自动转换为正斜杠 `/`，末尾缺少 `/` 会自动补全。
+- 示例：如果下载目录为 `D:\Downloads`，保存路径设为 `artworks/arts`，则图片保存到 `D:\Downloads\artworks\arts\`。
+- 如需保存到其他位置（如 `D:\_codes\artworks`），请在浏览器设置中将下载目录改为该路径，或在 Tampermonkey 设置中：**通用 → 配置模式 → 高级 → 下载(Beta) → 模式 → 浏览器 API**。
+
+## 项目结构
 
 ```
-web-saver.user.js        # Main Tampermonkey userscript
+web-saver.user.js        # 主用户脚本
 tests/
-  web-saver.test.js      # Unit tests (Node.js, no dependencies)
-  test-page.html         # Browser integration test page
-README.md                # This file
+  web-saver.test.js      # 单元测试（Node.js，无依赖）
+  test-page.html         # 浏览器集成测试页面
+README.md                # 本文件
 ```
 
-## Development & Testing
+## 开发与测试
 
-### Unit tests
+### 单元测试
 
 ```bash
 node tests/web-saver.test.js
 ```
 
-No external dependencies required — uses a built-in minimal test harness.
+无需外部依赖，使用内置最小测试框架。
 
-### Browser integration tests
+### 浏览器集成测试
 
-1. Install the userscript in Tampermonkey.
-2. Open `tests/test-page.html` in a browser.
-3. Press `Ctrl+Alt+I` to verify image saving works.
-4. Click **Run DOM Tests** on the page to validate image collection logic.
+1. 在 Tampermonkey 中安装用户脚本。
+2. 在浏览器中打开 `tests/test-page.html`。
+3. 按 `Ctrl+Alt+I` 验证图片保存功能。
+4. 点击页面上的「运行 DOM 测试」按钮验证图片收集逻辑。
 
-## Permissions
+## 权限说明
 
-The script requests these Tampermonkey grants:
+脚本请求的 Tampermonkey 权限：
 
-| Grant                         | Purpose                                      |
-|-------------------------------|----------------------------------------------|
-| `GM_setValue` / `GM_getValue` | Persist settings                             |
-| `GM_download`                 | Download images with conflict handling       |
-| `GM_notification`             | (reserved for future notifications)          |
-| `GM_registerMenuCommand`      | Add entries to the Tampermonkey context menu |
-| `GM_addStyle`                 | Inject CSS for toast & settings UI           |
+| 权限                          | 用途                             |
+|-------------------------------|--------------------------------|
+| `GM_setValue` / `GM_getValue` | 持久化设置                       |
+| `GM_download`                 | 下载图片（支持冲突处理和子目录）   |
+| `GM_notification`             | 保留（未来通知功能）               |
+| `GM_registerMenuCommand`      | 在 Tampermonkey 菜单中添加操作项 |
+| `GM_addStyle`                 | 注入 Toast 和设置面板的 CSS 样式 |
 
-## License
+## 许可证
 
 MIT

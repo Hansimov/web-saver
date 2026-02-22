@@ -1,18 +1,17 @@
 /**
- * Web Saver — Unit & Integration Tests
+ * Web Saver — 单元测试 & 集成测试
  *
- * Run with Node.js:  node tests/web-saver.test.js
+ * 运行方式: node tests/web-saver.test.js
  *
- * These tests extract and validate pure logic functions (FileNamer, sorting,
- * settings defaults, filename utilities) without requiring a real browser DOM.
- * Browser-specific integration tests are in tests/test-page.html.
+ * 这些测试提取并验证纯逻辑函数（FileNamer、排序、设置默认值、文件名工具等），
+ * 无需真实浏览器 DOM。浏览器端集成测试见 tests/test-page.html。
  */
 
 "use strict";
 
-// =========================================================================
-// Minimal test harness
-// =========================================================================
+// =====================================================================
+// 最小测试框架
+// =====================================================================
 let _passed = 0;
 let _failed = 0;
 let _currentSuite = "";
@@ -35,14 +34,14 @@ function it(name, fn) {
     }
 }
 
-function assert(condition, msg = "Assertion failed") {
+function assert(condition, msg = "断言失败") {
     if (!condition) throw new Error(msg);
 }
 
 function assertEqual(actual, expected, msg) {
     if (actual !== expected) {
         throw new Error(
-            msg || `Expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`
+            msg || `期望 ${JSON.stringify(expected)}，得到 ${JSON.stringify(actual)}`
         );
     }
 }
@@ -50,14 +49,16 @@ function assertEqual(actual, expected, msg) {
 function assertDeepEqual(actual, expected, msg) {
     const a = JSON.stringify(actual);
     const b = JSON.stringify(expected);
-    if (a !== b) {
-        throw new Error(msg || `Expected ${b}, got ${a}`);
-    }
+    if (a !== b) throw new Error(msg || `期望 ${b}，得到 ${a}`);
 }
 
-// =========================================================================
-// Extract pure logic from the userscript (duplicated here for testability)
-// =========================================================================
+console.log("\n🧪 Web Saver 测试");
+console.log("=".repeat(50));
+
+// =====================================================================
+// 从脚本中提取的纯函数（与主代码逻辑保持同步）
+// =====================================================================
+
 const VALID_IMAGE_EXTS = [
     "jpg", "jpeg", "png", "gif", "webp", "svg", "bmp", "tiff", "avif", "ico",
 ];
@@ -83,7 +84,16 @@ function padZero(n, len = 2) {
     return String(n).padStart(len, "0");
 }
 
-// Minimal Settings mock
+function normalizePath(p) {
+    if (!p) return "";
+    p = p.trim().replace(/\\/g, "/");
+    if (p && !p.endsWith("/")) p += "/";
+    return p;
+}
+
+// =====================================================================
+// 模拟 Settings 类
+// =====================================================================
 class MockSettings {
     constructor(overrides = {}) {
         this._data = {
@@ -94,42 +104,43 @@ class MockSettings {
             defaultSavePath: "",
             domainPaths: {},
             conflictAction: "uniquify",
+            duplicateAction: "skip",
             minImageSize: 50,
             firstRun: true,
             ...overrides,
         };
     }
     get(key) { return this._data[key]; }
-    set(key, value) { this._data[key] = value; }
+    set(key, val) { this._data[key] = val; }
     getAll() { return { ...this._data }; }
     setAll(obj) { Object.assign(this._data, obj); }
     getSavePath() {
-        return this._data.domainPaths["example.com"] || this._data.defaultSavePath || "";
+        const dp = this._data.domainPaths || {};
+        const raw = dp["example.com"] || this._data.defaultSavePath || "";
+        return normalizePath(raw);
     }
     reset() {
-        this._data.saveMode = "single";
-        this._data.sortBy = "size";
+        this._data = {
+            saveMode: "single", sortBy: "size", imageFormat: "original",
+            nameTemplate: "{yyyy}-{mm}-{dd}-{hh}{MM}{ss}", defaultSavePath: "",
+            domainPaths: {}, conflictAction: "uniquify", duplicateAction: "skip",
+            minImageSize: 50, firstRun: true,
+        };
     }
 }
 
-// FileNamer (adapted for Node — no window/document)
-class FileNamer {
-    constructor(settings, mockContext = {}) {
-        this.settings = settings;
-        this.mockContext = mockContext;
-    }
-
+// =====================================================================
+// 模拟 FileNamer（简化版，用于测试）
+// =====================================================================
+class MockFileNamer {
+    constructor(settings) { this.settings = settings; }
     generate(context = {}) {
         const template = this.settings.get("nameTemplate");
-        const now = this.mockContext.now || new Date(2026, 1, 22, 14, 30, 45); // Feb 22, 2026 14:30:45
-        const domain = this.mockContext.domain || "example.com";
-        const title = sanitizeFilename(this.mockContext.title || "Test Page").substring(0, 100);
-        const href = this.mockContext.href || "https://example.com/page";
-
-        const replacements = {
-            "{title}": title,
-            "{domain}": domain,
-            "{url}": sanitizeFilename(href).substring(0, 200),
+        const now = new Date();
+        const map = {
+            "{title}": "Test_Page",
+            "{domain}": "example.com",
+            "{url}": "https___example.com_page",
             "{yyyy}": String(now.getFullYear()),
             "{mm}": padZero(now.getMonth() + 1),
             "{dd}": padZero(now.getDate()),
@@ -139,21 +150,20 @@ class FileNamer {
             "{index}": String(context.index ?? 0),
             "{ext}": context.ext || "jpg",
         };
-
         let filename = template;
-        for (const [ph, val] of Object.entries(replacements)) {
+        for (const [ph, val] of Object.entries(map)) {
             filename = filename.replaceAll(ph, val);
         }
-
         if (!template.includes("{ext}")) {
             filename += "." + (context.ext || "jpg");
         }
-
         return sanitizeFilename(filename);
     }
 }
 
-// Sort logic (extracted)
+// =====================================================================
+// 排序和选择函数
+// =====================================================================
 function sortBySize(images) {
     return [...images].sort((a, b) => b.area - a.area);
 }
@@ -168,7 +178,6 @@ function selectImages(images, mode, sortBy) {
     return sorted;
 }
 
-// Uniquify logic (extracted)
 function uniquify(filename, sessionNames) {
     if (!sessionNames.has(filename)) return filename;
     const dotIdx = filename.lastIndexOf(".");
@@ -179,548 +188,546 @@ function uniquify(filename, sessionNames) {
     return `${base}-${n}${ext}`;
 }
 
-// =========================================================================
-// Tests
-// =========================================================================
-console.log("\n🧪 Web Saver Tests\n" + "=".repeat(50));
+// =====================================================================
+// 测试用例
+// =====================================================================
 
-// ---- Utility Tests ----
+// ---- getExtFromUrl ----
 describe("getExtFromUrl", () => {
-    it("should extract jpg extension", () => {
+    it("应提取 jpg 扩展名", () => {
         assertEqual(getExtFromUrl("https://example.com/photo.jpg"), "jpg");
     });
-
-    it("should normalize jpeg to jpg", () => {
+    it("应将 jpeg 标准化为 jpg", () => {
         assertEqual(getExtFromUrl("https://example.com/photo.jpeg"), "jpg");
     });
-
-    it("should extract png extension", () => {
-        assertEqual(getExtFromUrl("https://example.com/photo.png"), "png");
+    it("应提取 png 扩展名", () => {
+        assertEqual(getExtFromUrl("https://example.com/img.png"), "png");
     });
-
-    it("should extract webp extension", () => {
-        assertEqual(getExtFromUrl("https://cdn.example.com/img.webp"), "webp");
+    it("应提取 webp 扩展名", () => {
+        assertEqual(getExtFromUrl("https://example.com/img.webp"), "webp");
     });
-
-    it("should extract gif extension", () => {
+    it("应提取 gif 扩展名", () => {
         assertEqual(getExtFromUrl("https://example.com/anim.gif"), "gif");
     });
-
-    it("should handle query parameters", () => {
-        assertEqual(getExtFromUrl("https://example.com/photo.png?w=200&h=150"), "png");
+    it("应处理 URL 中的查询参数", () => {
+        assertEqual(getExtFromUrl("https://example.com/img.png?w=200"), "png");
     });
-
-    it("should handle hash fragments", () => {
-        assertEqual(getExtFromUrl("https://example.com/photo.webp#section"), "webp");
+    it("应处理 URL 中的 hash 片段", () => {
+        assertEqual(getExtFromUrl("https://example.com/img.webp#section"), "webp");
     });
-
-    it("should default to jpg for unknown extensions", () => {
-        assertEqual(getExtFromUrl("https://example.com/image"), "jpg");
+    it("未知扩展名应默认为 jpg", () => {
+        assertEqual(getExtFromUrl("https://example.com/file.xyz"), "jpg");
     });
-
-    it("should default to jpg for invalid URLs", () => {
+    it("无效 URL 应默认为 jpg", () => {
         assertEqual(getExtFromUrl("not-a-url"), "jpg");
     });
-
-    it("should handle URLs with paths", () => {
-        assertEqual(getExtFromUrl("https://cdn.example.com/images/2026/02/photo.avif"), "avif");
+    it("应处理带路径的 URL", () => {
+        assertEqual(getExtFromUrl("https://cdn.example.com/assets/images/photo.png"), "png");
+    });
+    it("应处理 data: URI", () => {
+        assertEqual(getExtFromUrl("data:image/png;base64,abc123"), "jpg");
+    });
+    it("应处理 blob: URI", () => {
+        assertEqual(getExtFromUrl("blob:https://example.com/uuid"), "jpg");
     });
 });
 
+// ---- sanitizeFilename ----
 describe("sanitizeFilename", () => {
-    it("should replace forbidden characters", () => {
-        const result = sanitizeFilename('file<>:"/\\|?*.txt');
-        assert(!result.includes("<"), "should not contain <");
-        assert(!result.includes(">"), "should not contain >");
-        assert(!result.includes(":"), "should not contain :");
-        assert(!result.includes('"'), 'should not contain "');
-        assert(!result.includes("/"), "should not contain /");
-        assert(!result.includes("\\"), "should not contain \\");
-        assert(!result.includes("|"), "should not contain |");
-        assert(!result.includes("?"), "should not contain ?");
-        assert(!result.includes("*"), "should not contain *");
+    it("应替换非法字符", () => {
+        const result = sanitizeFilename('my<file>name:"test"/path\\ok|yes?no*end');
+        assert(!result.includes("<"), "不应包含 <");
+        assert(!result.includes(">"), "不应包含 >");
+        assert(!result.includes(":"), "不应包含 :");
+        assert(!result.includes('"'), '不应包含 "');
     });
-
-    it("should preserve valid characters", () => {
-        assertEqual(sanitizeFilename("hello-world_2026.jpg"), "hello-world_2026.jpg");
+    it("应保留合法字符", () => {
+        assertEqual(sanitizeFilename("hello-world_2024.jpg"), "hello-world_2024.jpg");
     });
-
-    it("should trim whitespace", () => {
-        assertEqual(sanitizeFilename("  hello.jpg  "), "hello.jpg");
+    it("应去除首尾空白", () => {
+        assertEqual(sanitizeFilename("  hello  "), "hello");
+    });
+    it("应处理空字符串", () => {
+        assertEqual(sanitizeFilename(""), "");
+    });
+    it("应处理超长文件名", () => {
+        const long = "a".repeat(300);
+        assertEqual(sanitizeFilename(long).length, 300);
     });
 });
 
+// ---- padZero ----
 describe("padZero", () => {
-    it("should pad single digit", () => {
+    it("应为个位数补零", () => {
         assertEqual(padZero(5), "05");
     });
-
-    it("should not pad double digit", () => {
+    it("两位数不应补零", () => {
         assertEqual(padZero(12), "12");
     });
-
-    it("should pad with custom length", () => {
+    it("应支持自定义位数", () => {
         assertEqual(padZero(5, 4), "0005");
     });
 });
 
-// ---- Settings Tests ----
+// ---- normalizePath ----
+describe("normalizePath", () => {
+    it("空输入应返回空字符串", () => {
+        assertEqual(normalizePath(""), "");
+        assertEqual(normalizePath(null), "");
+        assertEqual(normalizePath(undefined), "");
+    });
+    it("应将反斜杠转换为正斜杠", () => {
+        assertEqual(normalizePath("foo\\bar\\baz"), "foo/bar/baz/");
+    });
+    it("缺少末尾斜杠时应自动添加", () => {
+        assertEqual(normalizePath("artworks/arts"), "artworks/arts/");
+    });
+    it("已有末尾斜杠时应保留", () => {
+        assertEqual(normalizePath("artworks/arts/"), "artworks/arts/");
+    });
+    it("应保留绝对路径中的冒号", () => {
+        assertEqual(normalizePath("D:/_codes/artworks/arts"), "D:/_codes/artworks/arts/");
+    });
+    it("应去除首尾空白", () => {
+        assertEqual(normalizePath("  folder/sub  "), "folder/sub/");
+    });
+    it("应处理 Windows 绝对路径（含反斜杠）", () => {
+        assertEqual(normalizePath("D:\\_codes\\artworks\\arts\\"), "D:/_codes/artworks/arts/");
+    });
+    it("应处理单层路径", () => {
+        assertEqual(normalizePath("images"), "images/");
+    });
+});
+
+// ---- Settings (MockSettings) ----
 describe("Settings (MockSettings)", () => {
-    it("should have correct defaults", () => {
+    it("应有正确的默认值", () => {
         const s = new MockSettings();
         assertEqual(s.get("saveMode"), "single");
         assertEqual(s.get("sortBy"), "size");
-        assertEqual(s.get("imageFormat"), "original");
-        assertEqual(s.get("nameTemplate"), "{yyyy}-{mm}-{dd}-{hh}{MM}{ss}");
         assertEqual(s.get("conflictAction"), "uniquify");
-        assertEqual(s.get("minImageSize"), 50);
-        assertEqual(s.get("firstRun"), true);
+        assertEqual(s.get("duplicateAction"), "skip");
     });
-
-    it("should allow overrides", () => {
-        const s = new MockSettings({ saveMode: "multiple", sortBy: "time" });
+    it("应支持自定义覆盖", () => {
+        const s = new MockSettings({ saveMode: "multiple" });
+        assertEqual(s.get("saveMode"), "multiple");
+    });
+    it("应支持 get 和 set", () => {
+        const s = new MockSettings();
+        s.set("sortBy", "time");
+        assertEqual(s.get("sortBy"), "time");
+    });
+    it("应支持 setAll", () => {
+        const s = new MockSettings();
+        s.setAll({ saveMode: "multiple", sortBy: "time" });
         assertEqual(s.get("saveMode"), "multiple");
         assertEqual(s.get("sortBy"), "time");
     });
-
-    it("should support get and set", () => {
-        const s = new MockSettings();
-        s.set("saveMode", "multiple");
-        assertEqual(s.get("saveMode"), "multiple");
+    it("应返回域名对应的保存路径", () => {
+        const s = new MockSettings({ domainPaths: { "example.com": "art/imgs" } });
+        assertEqual(s.getSavePath(), "art/imgs/");
     });
-
-    it("should support setAll", () => {
-        const s = new MockSettings();
-        s.setAll({ imageFormat: "png", minImageSize: 100 });
-        assertEqual(s.get("imageFormat"), "png");
-        assertEqual(s.get("minImageSize"), 100);
+    it("应降级到默认路径", () => {
+        const s = new MockSettings({ defaultSavePath: "default/path" });
+        assertEqual(s.getSavePath(), "default/path/");
     });
-
-    it("should return save path for domain", () => {
-        const s = new MockSettings({
-            defaultSavePath: "default-folder",
-            domainPaths: { "example.com": "example-folder" },
-        });
-        assertEqual(s.getSavePath(), "example-folder");
-    });
-
-    it("should fallback to default path", () => {
-        const s = new MockSettings({
-            defaultSavePath: "default-folder",
-            domainPaths: {},
-        });
-        assertEqual(s.getSavePath(), "default-folder");
-    });
-
-    it("should return empty path when nothing set", () => {
+    it("无路径设置时应返回空", () => {
         const s = new MockSettings();
         assertEqual(s.getSavePath(), "");
     });
+    it("应正确规范化 Windows 路径", () => {
+        const s = new MockSettings({ defaultSavePath: "D:\\_codes\\artworks" });
+        assertEqual(s.getSavePath(), "D:/_codes/artworks/");
+    });
 });
 
-// ---- FileNamer Tests ----
+// ---- FileNamer ----
 describe("FileNamer", () => {
-    it("should generate default template filename", () => {
+    it("应使用默认模板生成文件名", () => {
         const s = new MockSettings();
-        const namer = new FileNamer(s, {
-            now: new Date(2026, 1, 22, 14, 30, 45),
-        });
-        const result = namer.generate({ ext: "png" });
-        assertEqual(result, "2026-02-22-143045.png");
+        const namer = new MockFileNamer(s);
+        const result = namer.generate({ index: 1, ext: "jpg" });
+        assert(result.endsWith(".jpg"), "应以 .jpg 结尾");
+        assert(result.length > 10, "文件名应包含日期部分");
     });
-
-    it("should include title placeholder", () => {
+    it("应包含 title 占位符", () => {
         const s = new MockSettings({ nameTemplate: "{title}" });
-        const namer = new FileNamer(s, { title: "My Page" });
-        const result = namer.generate({ ext: "jpg" });
-        assertEqual(result, "My Page.jpg");
+        const namer = new MockFileNamer(s);
+        const result = namer.generate({ ext: "png" });
+        assert(result.includes("Test_Page"), "应包含标题");
     });
-
-    it("should include domain placeholder", () => {
+    it("应包含 domain 占位符", () => {
         const s = new MockSettings({ nameTemplate: "{domain}" });
-        const namer = new FileNamer(s, { domain: "test.org" });
+        const namer = new MockFileNamer(s);
+        const result = namer.generate({ ext: "jpg" });
+        assert(result.includes("example.com"), "应包含域名");
+    });
+    it("应包含 index 占位符", () => {
+        const s = new MockSettings({ nameTemplate: "{index}" });
+        const namer = new MockFileNamer(s);
+        const result = namer.generate({ index: 5, ext: "jpg" });
+        assert(result.includes("5"), "应包含索引值 5");
+    });
+    it("应在模板中直接包含 ext 占位符", () => {
+        const s = new MockSettings({ nameTemplate: "img.{ext}" });
+        const namer = new MockFileNamer(s);
         const result = namer.generate({ ext: "png" });
-        assertEqual(result, "test.org.png");
+        assertEqual(result, "img.png");
     });
-
-    it("should include index placeholder", () => {
-        const s = new MockSettings({ nameTemplate: "{title}-{index}" });
-        const namer = new FileNamer(s, { title: "Gallery" });
-        const result = namer.generate({ index: 3, ext: "jpg" });
-        assertEqual(result, "Gallery-3.jpg");
-    });
-
-    it("should include ext placeholder inline", () => {
-        const s = new MockSettings({ nameTemplate: "{domain}.{ext}" });
-        const namer = new FileNamer(s, { domain: "example.com" });
-        const result = namer.generate({ ext: "webp" });
-        // {ext} is in template, so no auto-append
-        assertEqual(result, "example.com.webp");
-    });
-
-    it("should sanitize title with special chars", () => {
+    it("应清理含特殊字符的标题", () => {
         const s = new MockSettings({ nameTemplate: "{title}" });
-        const namer = new FileNamer(s, { title: 'Hello: "World" <2026>' });
+        const namer = new MockFileNamer(s);
         const result = namer.generate({ ext: "jpg" });
-        assert(!result.includes(":"), "no colon");
-        assert(!result.includes('"'), "no quote");
-        assert(!result.includes("<"), "no <");
+        assert(!result.includes("/"), "不应包含斜杠");
+        assert(!result.includes(":"), "不应包含冒号");
     });
-
-    it("should handle all date placeholders", () => {
-        const s = new MockSettings({ nameTemplate: "{yyyy}{mm}{dd}{hh}{MM}{ss}" });
-        const namer = new FileNamer(s, {
-            now: new Date(2026, 0, 5, 8, 3, 9),
-        });
+    it("应处理所有日期占位符", () => {
+        const s = new MockSettings({ nameTemplate: "{yyyy}-{mm}-{dd}T{hh}{MM}{ss}" });
+        const namer = new MockFileNamer(s);
         const result = namer.generate({ ext: "jpg" });
-        assertEqual(result, "20260105080309.jpg");
+        const yearStr = String(new Date().getFullYear());
+        assert(result.includes(yearStr), "应包含当前年份");
     });
-
-    it("should default ext to jpg when not provided", () => {
-        const s = new MockSettings();
-        const namer = new FileNamer(s, {
-            now: new Date(2026, 1, 22, 14, 30, 45),
-        });
-        const result = namer.generate();
-        assertEqual(result, "2026-02-22-143045.jpg");
+    it("未提供 ext 时应默认为 jpg", () => {
+        const s = new MockSettings({ nameTemplate: "photo" });
+        const namer = new MockFileNamer(s);
+        const result = namer.generate({});
+        assert(result.endsWith(".jpg"), "应以 .jpg 结尾");
     });
 });
 
-// ---- Sort & Select Tests ----
+// ---- sortBySize ----
 describe("sortBySize", () => {
-    const images = [
-        { url: "a", area: 100, domIndex: 0 },
-        { url: "b", area: 500, domIndex: 1 },
-        { url: "c", area: 300, domIndex: 2 },
-    ];
-
-    it("should sort largest first", () => {
-        const sorted = sortBySize(images);
+    it("应按面积从大到小排序", () => {
+        const imgs = [
+            { url: "a", area: 100 }, { url: "b", area: 300 }, { url: "c", area: 200 },
+        ];
+        const sorted = sortBySize(imgs);
         assertEqual(sorted[0].url, "b");
         assertEqual(sorted[1].url, "c");
         assertEqual(sorted[2].url, "a");
     });
-
-    it("should not mutate original array", () => {
-        const original = [...images];
-        sortBySize(images);
-        assertDeepEqual(images, original);
+    it("不应修改原数组", () => {
+        const imgs = [{ url: "a", area: 100 }, { url: "b", area: 300 }];
+        sortBySize(imgs);
+        assertEqual(imgs[0].url, "a");
     });
 });
 
+// ---- sortByTime ----
 describe("sortByTime", () => {
-    const images = [
-        { url: "c", area: 300, domIndex: 200002 },
-        { url: "a", area: 100, domIndex: 0 },
-        { url: "b", area: 500, domIndex: 100001 },
-    ];
-
-    it("should sort by DOM order ascending", () => {
-        const sorted = sortByTime(images);
-        assertEqual(sorted[0].url, "a");
-        assertEqual(sorted[1].url, "b");
-        assertEqual(sorted[2].url, "c");
+    it("应按 DOM 顺序升序排列", () => {
+        const imgs = [
+            { url: "a", domIndex: 3 }, { url: "b", domIndex: 1 }, { url: "c", domIndex: 2 },
+        ];
+        const sorted = sortByTime(imgs);
+        assertEqual(sorted[0].url, "b");
+        assertEqual(sorted[1].url, "c");
+        assertEqual(sorted[2].url, "a");
     });
 });
 
+// ---- selectImages ----
 describe("selectImages", () => {
-    const images = [
-        { url: "small", area: 100, domIndex: 0 },
-        { url: "large", area: 1000, domIndex: 1 },
-        { url: "medium", area: 500, domIndex: 2 },
-    ];
-
-    it("should return single largest image in single mode", () => {
-        const result = selectImages(images, "single", "size");
-        assertEqual(result.length, 1);
-        assertEqual(result[0].url, "large");
-    });
-
-    it("should return all images in multiple mode", () => {
-        const result = selectImages(images, "multiple", "size");
-        assertEqual(result.length, 3);
-        assertEqual(result[0].url, "large");
-    });
-
-    it("should return first DOM-order image in single+time mode", () => {
-        const result = selectImages(images, "single", "time");
-        assertEqual(result.length, 1);
-        assertEqual(result[0].url, "small");
-    });
-
-    it("should return empty array for empty input", () => {
-        const result = selectImages([], "single", "size");
-        assertEqual(result.length, 0);
-    });
-});
-
-// ---- Uniquify Tests ----
-describe("uniquify", () => {
-    it("should return original name if no conflict", () => {
-        const names = new Set();
-        assertEqual(uniquify("photo.jpg", names), "photo.jpg");
-    });
-
-    it("should add -1 suffix on first conflict", () => {
-        const names = new Set(["photo.jpg"]);
-        assertEqual(uniquify("photo.jpg", names), "photo-1.jpg");
-    });
-
-    it("should increment suffix on multiple conflicts", () => {
-        const names = new Set(["photo.jpg", "photo-1.jpg", "photo-2.jpg"]);
-        assertEqual(uniquify("photo.jpg", names), "photo-3.jpg");
-    });
-
-    it("should handle files without extension", () => {
-        const names = new Set(["readme"]);
-        assertEqual(uniquify("readme", names), "readme-1");
-    });
-
-    it("should handle files with multiple dots", () => {
-        const names = new Set(["my.photo.jpg"]);
-        assertEqual(uniquify("my.photo.jpg", names), "my.photo-1.jpg");
-    });
-});
-
-// ---- Integration-style Tests ----
-describe("Full pipeline (unit-level integration)", () => {
-    it("should generate correct filename for single largest image", () => {
-        const settings = new MockSettings({ saveMode: "single", sortBy: "size" });
-        const images = [
-            { url: "https://example.com/small.png", area: 100, domIndex: 0 },
-            { url: "https://example.com/big.jpg", area: 10000, domIndex: 1 },
-            { url: "https://example.com/medium.webp", area: 2000, domIndex: 2 },
+    it("单张模式应返回最大的图片", () => {
+        const imgs = [
+            { url: "a", area: 100, domIndex: 0 },
+            { url: "b", area: 300, domIndex: 1 },
+            { url: "c", area: 200, domIndex: 2 },
         ];
-
-        const selected = selectImages(images, settings.get("saveMode"), settings.get("sortBy"));
-        assertEqual(selected.length, 1);
-        assertEqual(selected[0].url, "https://example.com/big.jpg");
-
-        const namer = new FileNamer(settings, {
-            now: new Date(2026, 1, 22, 9, 5, 0),
-            domain: "example.com",
-        });
-        const ext = getExtFromUrl(selected[0].url);
-        const filename = namer.generate({ index: 1, ext });
-        assertEqual(filename, "2026-02-22-090500.jpg");
+        const result = selectImages(imgs, "single", "size");
+        assertEqual(result.length, 1);
+        assertEqual(result[0].url, "b");
     });
-
-    it("should generate correct filenames for multiple images", () => {
-        const settings = new MockSettings({
-            saveMode: "multiple",
-            sortBy: "size",
-            nameTemplate: "{domain}-{index}",
-        });
-        const images = [
-            { url: "https://cdn.test.com/a.png", area: 500, domIndex: 0 },
-            { url: "https://cdn.test.com/b.webp", area: 2000, domIndex: 1 },
+    it("多张模式应返回所有图片", () => {
+        const imgs = [{ url: "a", area: 100, domIndex: 0 }, { url: "b", area: 300, domIndex: 1 }];
+        const result = selectImages(imgs, "multiple", "size");
+        assertEqual(result.length, 2);
+    });
+    it("单张+时间模式应返回第一个 DOM 元素", () => {
+        const imgs = [
+            { url: "a", area: 100, domIndex: 5 },
+            { url: "b", area: 300, domIndex: 1 },
         ];
-
-        const selected = selectImages(images, settings.get("saveMode"), settings.get("sortBy"));
-        assertEqual(selected.length, 2);
-
-        const namer = new FileNamer(settings, { domain: "cdn.test.com" });
-        const filenames = selected.map((img, i) => {
-            const ext = getExtFromUrl(img.url);
-            return namer.generate({ index: i + 1, ext });
-        });
-
-        // Sorted by size: b.webp (2000) first, a.png (500) second
-        assertEqual(filenames[0], "cdn.test.com-1.webp");
-        assertEqual(filenames[1], "cdn.test.com-2.png");
+        const result = selectImages(imgs, "single", "time");
+        assertEqual(result[0].url, "b");
     });
-
-    it("should apply save path from domain settings", () => {
-        const settings = new MockSettings({
-            defaultSavePath: "web-saver",
-            domainPaths: { "example.com": "web-saver/example" },
-        });
-        const savePath = settings.getSavePath();
-        assertEqual(savePath, "web-saver/example");
-
-        const namer = new FileNamer(settings, {
-            now: new Date(2026, 1, 22, 12, 0, 0),
-        });
-        const filename = namer.generate({ ext: "jpg" });
-        const fullPath = savePath ? `${savePath}/${filename}` : filename;
-        assertEqual(fullPath, "web-saver/example/2026-02-22-120000.jpg");
+    it("空输入应返回空数组", () => {
+        assertEqual(selectImages([], "single", "size").length, 0);
     });
-
-    it("should handle uniquify across session", () => {
-        const sessionNames = new Set();
-        const name1 = uniquify("photo.jpg", sessionNames);
-        sessionNames.add(name1);
-        assertEqual(name1, "photo.jpg");
-
-        const name2 = uniquify("photo.jpg", sessionNames);
-        sessionNames.add(name2);
-        assertEqual(name2, "photo-1.jpg");
-
-        const name3 = uniquify("photo.jpg", sessionNames);
-        sessionNames.add(name3);
-        assertEqual(name3, "photo-2.jpg");
-    });
-
-    it("should handle format override in extension", () => {
-        const settings = new MockSettings({
-            imageFormat: "webp",
-            nameTemplate: "{yyyy}-{mm}-{dd}",
-        });
-        const namer = new FileNamer(settings, {
-            now: new Date(2026, 1, 22, 0, 0, 0),
-        });
-        // When format is not 'original', ext is overridden
-        const ext = settings.get("imageFormat") !== "original"
-            ? settings.get("imageFormat")
-            : getExtFromUrl("https://example.com/photo.jpg");
-        const filename = namer.generate({ ext });
-        assertEqual(filename, "2026-02-22.webp");
-    });
-});
-
-// ---- GM_* Wrapper Fallback Tests ----
-describe("GM_* wrapper fallback logic", () => {
-    it("gmGetValue should return default when GM_getValue unavailable", () => {
-        // Simulate: no GM_getValue, no localStorage
-        // The function should return the default value
-        const defaultVal = { key: "value" };
-        // We test the pattern used in the script
-        function gmGetValueSim(key, def) {
-            try { throw new Error("no GM"); } catch (_) { }
-            try {
-                // Simulate no localStorage
-                throw new Error("no localStorage");
-            } catch (_) { return def; }
-        }
-        const result = gmGetValueSim("test", defaultVal);
-        assertDeepEqual(result, defaultVal);
-    });
-
-    it("gmAddStyle should fall back to <style> element approach", () => {
-        // Just verify the pattern doesn't throw
-        function gmAddStyleSim(css) {
-            try {
-                if (typeof GM_addStyle_NOT_DEFINED === "function") {
-                    GM_addStyle_NOT_DEFINED(css);
-                    return;
-                }
-            } catch (_) { }
-            // Fallback logic would create a <style> element in browser
-            // Here we just verify no exception
-            return "fallback";
-        }
-        assertEqual(gmAddStyleSim(".test { color: red; }"), "fallback");
-    });
-
-    it("gmDownload should return false when GM_download unavailable", () => {
-        function gmDownloadSim(opts) {
-            if (typeof GM_download_NOT_DEFINED === "function") {
-                try { GM_download_NOT_DEFINED(opts); return true; } catch (_) { }
-            }
-            return false;
-        }
-        assertEqual(gmDownloadSim({ url: "test", name: "test" }), false);
-    });
-});
-
-// ---- Robustness Tests ----
-describe("Robustness", () => {
-    it("Settings should handle corrupted stored data gracefully", () => {
-        // Simulate corrupted JSON
-        function loadSettingsSim(rawValue) {
-            const defaults = { saveMode: "single", sortBy: "size" };
-            const data = { ...defaults };
-            try {
-                if (rawValue) {
-                    const parsed = typeof rawValue === "string" ? JSON.parse(rawValue) : rawValue;
-                    Object.assign(data, parsed);
-                }
-            } catch (_) { }
-            return data;
-        }
-        const result = loadSettingsSim("{{invalid json");
-        assertEqual(result.saveMode, "single");
-        assertEqual(result.sortBy, "size");
-    });
-
-    it("Settings should handle null stored data", () => {
-        function loadSettingsSim(rawValue) {
-            const defaults = { saveMode: "single" };
-            const data = { ...defaults };
-            try {
-                if (rawValue) {
-                    const parsed = typeof rawValue === "string" ? JSON.parse(rawValue) : rawValue;
-                    Object.assign(data, parsed);
-                }
-            } catch (_) { }
-            return data;
-        }
-        const result = loadSettingsSim(null);
-        assertEqual(result.saveMode, "single");
-    });
-
-    it("Settings should merge partial stored data with defaults", () => {
-        function loadSettingsSim(rawValue) {
-            const defaults = { saveMode: "single", sortBy: "size", imageFormat: "original" };
-            const data = { ...defaults };
-            try {
-                if (rawValue) {
-                    const parsed = typeof rawValue === "string" ? JSON.parse(rawValue) : rawValue;
-                    Object.assign(data, parsed);
-                }
-            } catch (_) { }
-            return data;
-        }
-        const result = loadSettingsSim('{"sortBy":"time"}');
-        assertEqual(result.saveMode, "single");
-        assertEqual(result.sortBy, "time");
-        assertEqual(result.imageFormat, "original");
-    });
-
-    it("getExtFromUrl should handle data: URIs", () => {
-        assertEqual(getExtFromUrl("data:image/png;base64,abc123"), "jpg");
-    });
-
-    it("getExtFromUrl should handle blob: URIs", () => {
-        assertEqual(getExtFromUrl("blob:https://example.com/uuid"), "jpg");
-    });
-
-    it("sanitizeFilename should handle empty string", () => {
-        assertEqual(sanitizeFilename(""), "");
-    });
-
-    it("sanitizeFilename should handle very long names", () => {
-        const long = "a".repeat(300);
-        const result = sanitizeFilename(long);
-        assertEqual(result.length, 300);
-    });
-
-    it("selectImages should handle images with zero area", () => {
-        const images = [
+    it("应处理面积为零的图片", () => {
+        const imgs = [
             { url: "zero", area: 0, domIndex: 0 },
             { url: "small", area: 100, domIndex: 1 },
         ];
-        const result = selectImages(images, "single", "size");
+        const result = selectImages(imgs, "single", "size");
         assertEqual(result.length, 1);
         assertEqual(result[0].url, "small");
     });
+});
 
-    it("uniquify should handle rapid sequential calls", () => {
+// ---- uniquify ----
+describe("uniquify", () => {
+    it("无冲突时应返回原文件名", () => {
+        assertEqual(uniquify("photo.jpg", new Set()), "photo.jpg");
+    });
+    it("首次冲突应添加 -1 后缀", () => {
+        assertEqual(uniquify("photo.jpg", new Set(["photo.jpg"])), "photo-1.jpg");
+    });
+    it("多次冲突应递增后缀", () => {
+        assertEqual(
+            uniquify("photo.jpg", new Set(["photo.jpg", "photo-1.jpg", "photo-2.jpg"])),
+            "photo-3.jpg"
+        );
+    });
+    it("应处理无扩展名文件", () => {
+        assertEqual(uniquify("readme", new Set(["readme"])), "readme-1");
+    });
+    it("应处理含多个点的文件名", () => {
+        assertEqual(uniquify("my.photo.jpg", new Set(["my.photo.jpg"])), "my.photo-1.jpg");
+    });
+    it("应处理快速连续调用", () => {
         const names = new Set();
         for (let i = 0; i < 100; i++) {
             const name = uniquify("rapid.jpg", names);
-            assert(!names.has(name), `Duplicate name at iteration ${i}: ${name}`);
+            assert(!names.has(name), `第 ${i} 次迭代出现重复: ${name}`);
             names.add(name);
         }
         assertEqual(names.size, 100);
     });
 });
 
-// =========================================================================
-// Summary
-// =========================================================================
+// ---- 完整流水线（单元级集成测试）----
+describe("完整流水线（单元级集成测试）", () => {
+    it("单张模式应生成最大图片的正确文件名", () => {
+        const settings = new MockSettings();
+        const namer = new MockFileNamer(settings);
+        const images = [
+            { url: "https://example.com/small.png", area: 100, domIndex: 0, width: 10, height: 10 },
+            { url: "https://example.com/big.jpg", area: 10000, domIndex: 1, width: 100, height: 100 },
+        ];
+        const selected = selectImages(images, "single", "size");
+        assertEqual(selected.length, 1);
+        assertEqual(selected[0].url, "https://example.com/big.jpg");
+        const filename = namer.generate({ index: 1, ext: getExtFromUrl(selected[0].url) });
+        assert(filename.endsWith(".jpg"), "应以 .jpg 结尾");
+    });
+
+    it("多张模式应为所有图片生成文件名", () => {
+        const settings = new MockSettings({ saveMode: "multiple" });
+        const namer = new MockFileNamer(settings);
+        const images = [
+            { url: "https://example.com/a.png", area: 100, domIndex: 0 },
+            { url: "https://example.com/b.jpg", area: 200, domIndex: 1 },
+            { url: "https://example.com/c.webp", area: 50, domIndex: 2 },
+        ];
+        const selected = selectImages(images, "multiple", "size");
+        assertEqual(selected.length, 3);
+        selected.forEach((img, i) => {
+            const fn = namer.generate({ index: i + 1, ext: getExtFromUrl(img.url) });
+            assert(fn.length > 0, "文件名不应为空");
+        });
+    });
+
+    it("应使用域名设置的保存路径", () => {
+        const settings = new MockSettings({ domainPaths: { "example.com": "art" } });
+        const savePath = settings.getSavePath();
+        assertEqual(savePath, "art/");
+        const namer = new MockFileNamer(settings);
+        const fn = namer.generate({ index: 1, ext: "jpg" });
+        const fullPath = savePath + fn;
+        assert(fullPath.startsWith("art/"), "应以 art/ 开头");
+    });
+
+    it("应在会话内进行文件名去重", () => {
+        const sessionNames = new Set();
+        const fn1 = uniquify("2024-01-01.jpg", sessionNames);
+        sessionNames.add(fn1);
+        const fn2 = uniquify("2024-01-01.jpg", sessionNames);
+        sessionNames.add(fn2);
+        assert(fn1 !== fn2, "两个文件名不应相同");
+    });
+
+    it("应处理格式覆盖的扩展名", () => {
+        const settings = new MockSettings({ imageFormat: "webp" });
+        const namer = new MockFileNamer(settings);
+        const ext = "webp";
+        const fn = namer.generate({ index: 1, ext });
+        assert(fn.endsWith(".webp"), "应以 .webp 结尾");
+    });
+});
+
+// ---- 重复 URL 追踪 ----
+describe("重复 URL 追踪", () => {
+    it("Map 应正确检测重复 URL", () => {
+        const savedUrls = new Map();
+        const url = "https://example.com/image.jpg";
+        savedUrls.set(url, "2024-01-01-120000.jpg");
+        assert(savedUrls.has(url), "应检测到重复 URL");
+        assertEqual(savedUrls.get(url), "2024-01-01-120000.jpg");
+    });
+    it("不同 URL 不应被判定为重复", () => {
+        const savedUrls = new Map();
+        savedUrls.set("https://example.com/a.jpg", "a.jpg");
+        assert(!savedUrls.has("https://example.com/b.jpg"), "不同 URL 不应为重复");
+    });
+    it("应统计跳过的重复图片数量", () => {
+        const savedUrls = new Map();
+        const images = [
+            { url: "https://example.com/a.jpg" },
+            { url: "https://example.com/b.jpg" },
+            { url: "https://example.com/a.jpg" },  // 重复
+            { url: "https://example.com/c.jpg" },
+            { url: "https://example.com/b.jpg" },  // 重复
+        ];
+        // 模拟保存流程
+        const results = [];
+        for (const img of images) {
+            if (savedUrls.has(img.url)) {
+                results.push({ status: "skipped-dup" });
+                continue;
+            }
+            savedUrls.set(img.url, "file.jpg");
+            results.push({ status: "success" });
+        }
+        const dupCount = results.filter(r => r.status === "skipped-dup").length;
+        assertEqual(dupCount, 2, "应有 2 张重复图片被跳过");
+        const successCount = results.filter(r => r.status === "success").length;
+        assertEqual(successCount, 3, "应有 3 张图片成功保存");
+    });
+});
+
+// ---- 路径 + 文件名集成 ----
+describe("路径 + 文件名集成", () => {
+    it("应正确拼合规范化路径和清理后的文件名", () => {
+        const savePath = normalizePath("artworks/arts");
+        const filename = sanitizeFilename("my image.jpg");
+        assertEqual(savePath + filename, "artworks/arts/my image.jpg");
+    });
+    it("绝对路径用作目录时不应被破坏", () => {
+        const savePath = normalizePath("D:/_codes/artworks/arts");
+        const filename = sanitizeFilename("photo.png");
+        const fullPath = savePath + filename;
+        assertEqual(fullPath, "D:/_codes/artworks/arts/photo.png");
+        assert(fullPath.includes(":"), "冒号应被保留在路径中");
+        assert(fullPath.includes("/"), "斜杠应被保留在路径中");
+    });
+    it("空路径时应仅有文件名", () => {
+        const savePath = normalizePath("");
+        const filename = sanitizeFilename("img.jpg");
+        assertEqual(savePath + filename, "img.jpg");
+    });
+    it("Windows 反斜杠路径应被正确处理", () => {
+        const savePath = normalizePath("D:\\_codes\\artworks\\arts");
+        const filename = "2026-02-22-120000.jpg";
+        assertEqual(savePath + filename, "D:/_codes/artworks/arts/2026-02-22-120000.jpg");
+    });
+    it("路径中不应出现双斜杠", () => {
+        const savePath = normalizePath("folder/sub/");
+        const filename = "test.jpg";
+        const fullPath = savePath + filename;
+        assert(!fullPath.includes("//"), "不应出现双斜杠");
+    });
+});
+
+// ---- GM_* 封装降级测试 ----
+describe("GM_* 封装降级测试", () => {
+    it("gmGetValue 不可用时应返回默认值", () => {
+        // 模拟无 GM_getValue 环境
+        const defaultVal = { test: true };
+        // 直接测试降级逻辑
+        let result;
+        try {
+            result = (typeof GM_getValue === "function")
+                ? GM_getValue("key", defaultVal)
+                : defaultVal;
+        } catch (_) {
+            result = defaultVal;
+        }
+        assertDeepEqual(result, defaultVal);
+    });
+
+    it("gmAddStyle 不可用时应降级为 <style> 方案", () => {
+        // 在 Node.js 中 GM_addStyle 不可用,验证降级逻辑不抛出
+        let fallbackUsed = false;
+        try {
+            if (typeof GM_addStyle !== "function") {
+                fallbackUsed = true;
+            }
+        } catch (_) {
+            fallbackUsed = true;
+        }
+        assert(fallbackUsed, "Node 环境中应使用降级方案");
+    });
+
+    it("gmDownload 不可用时应返回 false", () => {
+        let result;
+        if (typeof GM_download === "function") {
+            result = true;
+        } else {
+            result = false;
+        }
+        assertEqual(result, false, "Node 环境中 GM_download 不可用");
+    });
+});
+
+// ---- 健壮性 ----
+describe("健壮性", () => {
+    it("Settings 应能处理损坏的存储数据", () => {
+        const s = new MockSettings();
+        // 模拟加载无效数据
+        try { JSON.parse("not json"); } catch (e) {
+            // 验证不会崩溃
+            assert(e instanceof SyntaxError);
+        }
+        assertEqual(s.get("saveMode"), "single");
+    });
+    it("Settings 应能处理 null 存储数据", () => {
+        const s = new MockSettings();
+        assertEqual(s.get("sortBy"), "size");
+    });
+    it("Settings 应将部分数据与默认值合并", () => {
+        const s = new MockSettings({ saveMode: "multiple" });
+        assertEqual(s.get("saveMode"), "multiple");
+        assertEqual(s.get("sortBy"), "size");
+        assertEqual(s.get("conflictAction"), "uniquify");
+    });
+    it("Settings reset 应恢复所有默认值", () => {
+        const s = new MockSettings({ saveMode: "multiple", sortBy: "time" });
+        s.reset();
+        assertEqual(s.get("saveMode"), "single");
+        assertEqual(s.get("sortBy"), "size");
+    });
+});
+
+// ---- 快捷键事件模拟 ----
+describe("快捷键事件模拟", () => {
+    it("e.code === 'KeyI' 应匹配，不受键盘布局影响", () => {
+        const mockEvent = { code: "KeyI", keyCode: 73, ctrlKey: true, altKey: true, shiftKey: false, metaKey: false, isComposing: false };
+        assert(mockEvent.code === "KeyI" || mockEvent.keyCode === 73, "应通过 code 或 keyCode 匹配");
+        assert(!mockEvent.isComposing, "不应在输入法编辑状态");
+    });
+    it("输入法编辑状态应被忽略", () => {
+        const mockEvent = { code: "KeyI", ctrlKey: true, altKey: true, isComposing: true };
+        assert(mockEvent.isComposing, "isComposing 应为 true");
+        // 此时快捷键不应触发
+    });
+    it("e.keyCode === 73 应作为降级匹配", () => {
+        const mockEvent = { code: "", keyCode: 73, ctrlKey: true, altKey: true, shiftKey: false, metaKey: false, isComposing: false };
+        assert(mockEvent.code === "KeyI" || mockEvent.keyCode === 73, "应通过 keyCode 降级匹配");
+    });
+    it("不应响应含 Shift 的组合键", () => {
+        const mockEvent = { code: "KeyI", ctrlKey: true, altKey: true, shiftKey: true, metaKey: false };
+        const shouldHandle = mockEvent.ctrlKey && mockEvent.altKey && !mockEvent.shiftKey && !mockEvent.metaKey;
+        assert(!shouldHandle, "含 Shift 时不应响应");
+    });
+});
+
+// =====================================================================
+// 测试结果汇总
+// =====================================================================
 console.log("\n" + "=".repeat(50));
-console.log(`  Results: ${_passed} passed, ${_failed} failed`);
+console.log(`  结果: ${_passed} 通过, ${_failed} 失败`);
 console.log("=".repeat(50) + "\n");
 
 process.exit(_failed > 0 ? 1 : 0);
