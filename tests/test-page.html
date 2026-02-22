@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Web Saver — Integration Test Page</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            margin: 40px;
+            background: #f5f5f5;
+        }
+
+        h1 {
+            color: #333;
+        }
+
+        h2 {
+            color: #555;
+            margin-top: 30px;
+        }
+
+        .section {
+            background: #fff;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 16px 0;
+            box-shadow: 0 1px 4px rgba(0, 0, 0, .1);
+        }
+
+        img {
+            margin: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+
+        .bg-image {
+            width: 300px;
+            height: 200px;
+            background-image: url("https://picsum.photos/300/200?random=bg1");
+            background-size: cover;
+            display: inline-block;
+            margin: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+
+        .lazy-img {
+            display: inline-block;
+            width: 250px;
+            height: 180px;
+            background: #eee;
+            margin: 8px;
+            border-radius: 4px;
+        }
+
+        .instructions {
+            background: #e8f5e9;
+            border-left: 4px solid #4CAF50;
+            padding: 12px 18px;
+            border-radius: 4px;
+            margin: 16px 0;
+        }
+
+        .instructions code {
+            background: #c8e6c9;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: monospace;
+        }
+
+        .test-result {
+            padding: 8px 14px;
+            border-radius: 6px;
+            margin: 4px 0;
+            font-size: 14px;
+        }
+
+        .pass {
+            background: #e8f5e9;
+            color: #2e7d32;
+        }
+
+        .fail {
+            background: #ffebee;
+            color: #c62828;
+        }
+
+        #test-output {
+            margin-top: 20px;
+        }
+
+        button {
+            padding: 8px 18px;
+            border: none;
+            border-radius: 6px;
+            background: #4CAF50;
+            color: #fff;
+            cursor: pointer;
+            font-size: 14px;
+        }
+
+        button:hover {
+            background: #43A047;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>🧪 Web Saver — Integration Test Page</h1>
+
+    <div class="instructions">
+        <strong>Instructions:</strong><br>
+        1. Install the Web Saver userscript in Tampermonkey.<br>
+        2. Open this page in a browser.<br>
+        3. Press <code>Ctrl+Alt+I</code> to test save functionality.<br>
+        4. Check that the largest image is highlighted and downloaded.<br>
+        5. Open settings via the Tampermonkey menu → <code>⚙ Settings</code>.<br>
+        6. Click <strong>Run DOM Tests</strong> below to validate DOM collection logic.
+    </div>
+
+    <h2>1. Regular Images (various sizes)</h2>
+    <div class="section">
+        <!-- Small image (should be filtered if minSize > 30) -->
+        <img src="https://picsum.photos/30/30?random=1" alt="Tiny 30x30" width="30" height="30">
+        <!-- Medium image -->
+        <img src="https://picsum.photos/200/150?random=2" alt="Medium 200x150" width="200" height="150">
+        <!-- Large image (should be selected in single mode / size sort) -->
+        <img src="https://picsum.photos/600/400?random=3" alt="Large 600x400" width="600" height="400">
+        <!-- Another medium -->
+        <img src="https://picsum.photos/300/250?random=4" alt="Medium 300x250" width="300" height="250">
+    </div>
+
+    <h2>2. Background Image</h2>
+    <div class="section">
+        <div class="bg-image" title="Background image element"></div>
+    </div>
+
+    <h2>3. Lazy-Loaded Image</h2>
+    <div class="section">
+        <img class="lazy-img" data-src="https://picsum.photos/250/180?random=lazy1" alt="Lazy loaded image" width="250"
+            height="180">
+    </div>
+
+    <h2>4. Video Poster</h2>
+    <div class="section">
+        <video poster="https://picsum.photos/400/300?random=poster1" width="400" height="300" controls>
+            <source src="" type="video/mp4">
+            Your browser does not support video.
+        </video>
+    </div>
+
+    <h2>5. Various Formats</h2>
+    <div class="section">
+        <img src="https://picsum.photos/200/200.webp?random=5" alt="WebP image" width="200" height="200">
+        <img src="https://picsum.photos/200/200?random=6" alt="Random format" width="200" height="200">
+    </div>
+
+    <hr>
+
+    <h2>DOM Collection Tests</h2>
+    <button id="run-tests">Run DOM Tests</button>
+    <div id="test-output"></div>
+
+    <script>
+        document.getElementById("run-tests").addEventListener("click", () => {
+            const output = document.getElementById("test-output");
+            output.innerHTML = "";
+            const results = [];
+
+            function log(name, pass, detail = "") {
+                results.push({ name, pass, detail });
+                const el = document.createElement("div");
+                el.className = `test-result ${pass ? "pass" : "fail"}`;
+                el.textContent = `${pass ? "✓" : "✗"} ${name}${detail ? " — " + detail : ""}`;
+                output.appendChild(el);
+            }
+
+            // Test 1: Count <img> elements on page
+            const allImgs = document.querySelectorAll("img");
+            log("Page has img elements", allImgs.length >= 5, `Found ${allImgs.length}`);
+
+            // Test 2: Background image elements exist
+            const bgEls = document.querySelectorAll(".bg-image");
+            log("Page has background-image elements", bgEls.length >= 1, `Found ${bgEls.length}`);
+
+            // Test 3: Lazy-loaded images exist
+            const lazyImgs = document.querySelectorAll("img[data-src]");
+            log("Page has lazy-loaded images", lazyImgs.length >= 1, `Found ${lazyImgs.length}`);
+
+            // Test 4: Video poster exists
+            const posters = document.querySelectorAll("video[poster]");
+            log("Page has video poster", posters.length >= 1, `Found ${posters.length}`);
+
+            // Test 5: Largest image identification
+            let largest = null;
+            allImgs.forEach((img) => {
+                const area = (img.naturalWidth || img.width) * (img.naturalHeight || img.height);
+                if (!largest || area > largest.area) {
+                    largest = { el: img, area, alt: img.alt };
+                }
+            });
+            log(
+                "Largest image is 600x400",
+                largest && largest.alt === "Large 600x400",
+                `Largest: ${largest ? largest.alt : "none"} (area=${largest ? largest.area : 0})`
+            );
+
+            // Test 6: Small image should be filterable
+            const tinyImgs = Array.from(allImgs).filter(
+                (img) => (img.naturalWidth || img.width) < 50 && (img.naturalHeight || img.height) < 50
+            );
+            log("Tiny images detectable for filtering", tinyImgs.length >= 1, `Found ${tinyImgs.length} tiny images`);
+
+            // Summary
+            const passed = results.filter((r) => r.pass).length;
+            const total = results.length;
+            const summary = document.createElement("div");
+            summary.style.cssText = "margin-top:16px; font-weight:600; font-size:15px;";
+            summary.textContent = `Results: ${passed}/${total} passed`;
+            summary.style.color = passed === total ? "#2e7d32" : "#c62828";
+            output.appendChild(summary);
+        });
+    </script>
+</body>
+
+</html>
