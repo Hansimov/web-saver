@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         Web Saver
 // @namespace    http://tampermonkey.net/
-// @version      2026-02-22
+// @version      2026-02-23
 // @description  网页图片一键收集保存工具
 // @author       Hansimov
 // @match        *://*/*
@@ -150,6 +150,22 @@
     }
 
     /**
+     * 测试 URL 路径是否匹配 glob 模式。
+     * 模式中 * 匹配任意字符（包括 /），用于 URL 排除规则。
+     */
+    function urlMatchesGlob(url, pattern) {
+        if (!url || !pattern) return false;
+        try {
+            const pathname = new URL(url, window.location.href).pathname;
+            const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
+            const regexStr = escaped.replace(/\*/g, '.*');
+            return new RegExp(regexStr, 'i').test(pathname);
+        } catch (_) {
+            return false;
+        }
+    }
+
+    /**
      * 计算二进制数据的内容哈希（cyrb53 算法，53 位精度）
      * 返回 base36 字符串
      */
@@ -184,6 +200,531 @@
                 h = Math.imul(31, h) + url.charCodeAt(i) | 0;
             }
             return "url-" + (h >>> 0).toString(36);
+        }
+    }
+
+    // =====================================================================
+    // 图片评分 —— 多维度启发式算法，识别页面中真正展示的主图
+    // =====================================================================
+    class ImageScorer {
+        constructor() {
+            this._vpWidth = 0;
+            this._vpHeight = 0;
+            this._vpArea = 0;
+            this._vpCenterX = 0;
+            this._vpCenterY = 0;
+        }
+
+        /** 刷新视口尺寸 */
+        _refresh() {
+            this._vpWidth = window.innerWidth || document.documentElement.clientWidth || 1;
+            this._vpHeight = window.innerHeight || document.documentElement.clientHeight || 1;
+            this._vpArea = this._vpWidth * this._vpHeight;
+            this._vpCenterX = this._vpWidth / 2;
+            this._vpCenterY = this._vpHeight / 2;
+        }
+
+        /** 对所有图片进行评分 */
+        scoreAll(images) {
+            this._refresh();
+            for (const img of images) {
+                img.score = this.score(img);
+            }
+            return images;
+        }
+
+        /**
+         * 对单张图片进行多维度评分（0-100）
+         * 评分越高 → 越可能是用户想要保存的主图
+         */
+        score(imageInfo) {
+            let total = 0;
+            const el = imageInfo.element;
+            if (!el) return total;
+            try {
+                total += this._visibilityScore(el);
+                total += this._prominenceScore(el);
+                total += this._semanticScore(el);
+                total += this._contentScore(el, imageInfo);
+                total += this._resolutionScore(imageInfo);
+                total += this._urlScore(imageInfo);
+                total += this._overlayBonus(el);
+                total -= this._occlusionPenalty(el);
+            } catch (e) {
+                warn("图片评分异常:", e);
+            }
+            return Math.max(0, Math.round(total));
+        }
+
+        /**
+         * 视口可见性 + 中心距离（0-25 分）
+         * 当前视口中可见且居中的图片得分最高
+         */
+        _visibilityScore(el) {
+            const rect = el.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) return 0;
+            const visLeft = Math.max(rect.left, 0);
+            const visTop = Math.max(rect.top, 0);
+            const visRight = Math.min(rect.right, this._vpWidth);
+            const visBottom = Math.min(rect.bottom, this._vpHeight);
+            if (visRight <= visLeft || visBottom <= visTop) return 0;
+            const visArea = (visRight - visLeft) * (visBottom - visTop);
+            const elArea = rect.width * rect.height;
+            const visRatio = elArea > 0 ? visArea / elArea : 0;
+            let score = visRatio * 15;
+            const elCenterX = (rect.left + rect.right) / 2;
+            const elCenterY = (rect.top + rect.bottom) / 2;
+            const distX = Math.abs(elCenterX - this._vpCenterX) / this._vpWidth;
+            const distY = Math.abs(elCenterY - this._vpCenterY) / this._vpHeight;
+            const centerDist = Math.sqrt(distX * distX + distY * distY);
+            score += Math.max(0, (1 - centerDist * 2)) * 10;
+            return score;
+        }
+
+        /**
+         * 视觉显著性 —— 渲染面积占视口比例（0-25 分）
+         */
+        _prominenceScore(el) {
+            const rect = el.getBoundingClientRect();
+            const renderedArea = rect.width * rect.height;
+            if (renderedArea <= 0 || this._vpArea <= 0) return 0;
+            return Math.min((renderedArea / this._vpArea) * 50, 25);
+        }
+
+        /**
+         * 语义上下文（0-20 分）
+         * 遍历父元素链，检查内容容器、灯箱、画廊等
+         */
+        _semanticScore(el) {
+            let score = 0;
+            let node = el;
+            for (let i = 0; i < 10 && node && node !== document.body; i++) {
+                const tag = (node.tagName || "").toLowerCase();
+                const cls = (typeof node.className === "string" ? node.className : "").toLowerCase();
+                const role = (node.getAttribute?.("role") || "").toLowerCase();
+                if (tag === "main" || role === "main") score += 6;
+                if (tag === "article") score += 5;
+                if (tag === "figure") score += 5;
+                if (tag === "picture") score += 4;
+                if (/lightbox|fancybox|modal|overlay|viewer|gallery.?main|photo.?detail|image.?view|swiper.?slide/i.test(cls)) {
+                    score += 8;
+                }
+                if (role === "dialog") score += 4;
+                if (/\b(content|post|entry|detail|artwork|illustration)\b/i.test(cls)) {
+                    score += 3;
+                }
+                node = node.parentElement;
+            }
+            return Math.min(score, 20);
+        }
+
+        /**
+         * 内容信号（0-15 分）
+         * 判断是内容图片还是装饰元素
+         */
+        _contentScore(el, imageInfo) {
+            let score = 0;
+            const tag = (el.tagName || "").toLowerCase();
+            const cls = (typeof el.className === "string" ? el.className : "").toLowerCase();
+            const alt = (el.alt || "").toLowerCase();
+            const src = (imageInfo.url || "").toLowerCase();
+            if (tag === "img" && el.alt && el.alt.length > 3) score += 3;
+            if (/\b(icon|logo|avatar|profile|badge|emoji|spinner|loading)\b/i.test(cls)) score -= 10;
+            if (/\b(icon|logo|avatar|profile|badge|emoji)\b/i.test(alt)) score -= 5;
+            if (/\b(icon|logo|avatar|favicon|emoji|sprite|placeholder)\b/i.test(src)) score -= 5;
+            const w = imageInfo.width || 1;
+            const h = imageInfo.height || 1;
+            const ratio = Math.max(w / h, h / w);
+            if (ratio <= 2.5) score += 4;
+            else if (ratio > 5) score -= 3;
+            if (imageInfo.type === "img") score += 3;
+            else if (imageInfo.type === "lazy") score += 2;
+            if (w >= 200 && h >= 200) score += 3;
+            if (w >= 400 && h >= 400) score += 2;
+            return Math.min(Math.max(score, 0), 15);
+        }
+
+        /**
+         * 原始分辨率（0-15 分）
+         * 高分辨率图片更可能是内容主图
+         */
+        _resolutionScore(imageInfo) {
+            const area = imageInfo.area || 0;
+            if (area >= 1000000) return 15;
+            if (area >= 500000) return 12;
+            if (area >= 250000) return 9;
+            if (area >= 100000) return 6;
+            if (area >= 40000) return 3;
+            return 0;
+        }
+
+        /**
+         * URL 模式评分（-10 到 +10 分）
+         * 根据 URL 路径特征判断是否为内容图片
+         */
+        _urlScore(imageInfo) {
+            const url = (imageInfo.url || '');
+            let score = 0;
+            try {
+                const pathname = new URL(url, window.location.href).pathname.toLowerCase();
+                // 有明确图片扩展名 → 更可能是内容图片
+                if (/\.(jpe?g|png|gif|webp|avif|bmp|tiff|svg)$/i.test(pathname)) {
+                    score += 5;
+                }
+                // 无任何文件扩展名（API 端点、动态路径）→ 降分
+                else if (!/\.\w{1,5}$/.test(pathname)) {
+                    score -= 5;
+                }
+                // 图片服务路径加分
+                if (/\/(images?|uploads?|photos?|media|gallery|pictures?|artworks?)\//i.test(pathname)) {
+                    score += 3;
+                }
+                // 用户/头像相关路径降分
+                if (/\/(users?|avatars?|profiles?|accounts?)\//i.test(pathname)) {
+                    score -= 5;
+                }
+                // 以通用端点名结尾降分
+                if (/\/(content|data|blob|file|thumbnail|thumb)$/i.test(pathname)) {
+                    score -= 3;
+                }
+            } catch (_) { }
+            return Math.min(Math.max(score, -10), 10);
+        }
+
+        /**
+         * 覆盖层加成（0-20 分）
+         * 如果图片位于高 z-index 的覆盖层/模态框/灯箱中，大幅加分。
+         * 这使得用户打开灯箱查看大图时，灯箱中的图片会自动成为最佳候选。
+         */
+        _overlayBonus(el) {
+            let score = 0;
+            let node = el;
+            for (let i = 0; i < 15 && node && node !== document.body; i++) {
+                try {
+                    const style = getComputedStyle(node);
+                    const pos = style.position;
+                    const zIndex = parseInt(style.zIndex, 10) || 0;
+
+                    // 高 z-index + fixed/absolute 定位 = 覆盖层
+                    if ((pos === 'fixed' || pos === 'absolute') && zIndex >= 100) {
+                        const rect = node.getBoundingClientRect();
+                        const coversViewport = rect.width >= this._vpWidth * 0.5 &&
+                            rect.height >= this._vpHeight * 0.5;
+                        if (coversViewport) {
+                            score = Math.max(score, zIndex >= 1000 ? 20 : 15);
+                        } else {
+                            score = Math.max(score, 10);
+                        }
+                    }
+
+                    // role="dialog" 标记
+                    const role = (node.getAttribute?.('role') || '').toLowerCase();
+                    if (role === 'dialog') score = Math.max(score, 15);
+
+                    // <dialog> 元素（HTML5 原生对话框）
+                    if ((node.tagName || '').toLowerCase() === 'dialog' && node.open) {
+                        score = Math.max(score, 15);
+                    }
+                } catch (_) { }
+                node = node.parentElement;
+            }
+            return Math.min(score, 20);
+        }
+
+        /**
+         * 遮挡惩罚（0-20 分）
+         * 如果图片被覆盖层遮挡（不是顶层可见元素），扣分。
+         * 当灯箱/模态框打开时，背景中的图片将被大幅惩罚。
+         */
+        _occlusionPenalty(el) {
+            try {
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) return 20;
+
+                // 取图片中心点
+                const cx = (rect.left + rect.right) / 2;
+                const cy = (rect.top + rect.bottom) / 2;
+
+                // 确保中心点在视口内（视口外的图片不做遮挡检测）
+                if (cx < 0 || cx >= this._vpWidth || cy < 0 || cy >= this._vpHeight) return 0;
+
+                const topEl = document.elementFromPoint(cx, cy);
+                if (!topEl) return 0;
+
+                // 如果顶层元素是图片自身、或互为祖先/后代，则未被遮挡
+                if (topEl === el || el.contains(topEl) || topEl.contains(el)) return 0;
+
+                // 被遮挡 → 惩罚
+                return 20;
+            } catch (_) {
+                return 0;
+            }
+        }
+    }
+
+    // =====================================================================
+    // 原图 URL 解析 —— 尝试从缩略图/展示图找到最高分辨率原图
+    // =====================================================================
+    class OriginalUrlResolver {
+        /**
+         * 对给定图片信息，尝试解析出原始/高分辨率 URL。
+         * 返回最佳候选 URL；无法解析则返回原始 URL。
+         */
+        resolve(imageInfo) {
+            const candidates = [];
+            const el = imageInfo.element;
+            const currentUrl = imageInfo.url;
+            if (el) {
+                this._fromParentLink(el, candidates);
+                this._fromDataAttributes(el, candidates);
+                this._fromSrcset(el, candidates);
+                this._fromPictureSource(el, candidates);
+            }
+            this._fromUrlPatterns(currentUrl, candidates);
+            const seen = new Set([currentUrl]);
+            for (const c of candidates) {
+                if (c && !seen.has(c)) return c;
+            }
+            return currentUrl;
+        }
+
+        /** 检查父级 <a> 是否链接到高分辨率图片 */
+        _fromParentLink(el, out) {
+            let node = el.parentElement;
+            for (let i = 0; i < 3 && node; i++) {
+                if ((node.tagName || "").toLowerCase() === "a") {
+                    const href = node.href;
+                    if (href && this._looksLikeImageUrl(href)) out.push(href);
+                    break;
+                }
+                node = node.parentElement;
+            }
+        }
+
+        /** 从 data-* 属性中提取高分辨率 URL */
+        _fromDataAttributes(el, out) {
+            const attrs = [
+                "data-original", "data-src-full", "data-zoom-src",
+                "data-full-src", "data-large-src", "data-hi-res-src",
+                "data-raw-src", "data-original-src", "data-max-src",
+                "data-high-res", "data-zoom", "data-orig",
+            ];
+            for (const attr of attrs) {
+                const val = el.getAttribute(attr);
+                if (val) out.push(this._toAbsolute(val));
+            }
+        }
+
+        /** 从 srcset 中提取最高分辨率变体 */
+        _fromSrcset(el, out) {
+            const srcset = el.getAttribute("srcset");
+            if (!srcset) return;
+            const best = this._parseSrcsetBest(srcset);
+            if (best) out.push(this._toAbsolute(best));
+        }
+
+        /** 从 <picture> 的 <source> 中提取最高分辨率变体 */
+        _fromPictureSource(el, out) {
+            const picture = el.closest?.("picture");
+            if (!picture) return;
+            for (const source of picture.querySelectorAll("source")) {
+                const srcset = source.getAttribute("srcset");
+                if (!srcset) continue;
+                const candidate = this._parseSrcsetBest(srcset);
+                if (candidate) out.push(this._toAbsolute(candidate));
+            }
+        }
+
+        /** 通过 URL 模式替换尝试获取原图 */
+        _fromUrlPatterns(url, out) {
+            try {
+                const u = new URL(url, window.location.href);
+                const resizeParams = [
+                    "w", "h", "width", "height", "resize", "size",
+                    "fit", "quality", "q", "auto", "dpr", "tw", "th", "sw", "sh",
+                ];
+                let modified = false;
+                for (const p of resizeParams) {
+                    if (u.searchParams.has(p)) {
+                        u.searchParams.delete(p);
+                        modified = true;
+                    }
+                }
+                if (modified) out.push(u.href);
+                const pathname = u.pathname;
+                const patterns = [
+                    [/(_thumb|_small|_medium|_s|_m|_t)(\.[a-z]+)$/i, "$2"],
+                    [/\/thumb(nail)?s?\//i, "/originals/"],
+                    [/\/resize\/\d+x?\d*\//i, "/"],
+                    [/-\d+x\d+(\.[a-z]+)$/i, "$1"],
+                    [/\/[wh]_\d+(?:,[wh]_\d+)*\//gi, "/"],
+                    [/\/(small|medium|thumbnail)\//i, "/large/"],
+                ];
+                for (const [regex, replacement] of patterns) {
+                    if (regex.test(pathname)) {
+                        const newPath = pathname.replace(regex, replacement);
+                        if (newPath !== pathname) {
+                            const newUrl = new URL(u.href);
+                            newUrl.pathname = newPath;
+                            out.push(newUrl.href);
+                        }
+                    }
+                }
+            } catch (_) { }
+        }
+
+        /** 解析 srcset 属性，返回最大尺寸的 URL */
+        _parseSrcsetBest(srcset) {
+            let best = null;
+            let bestSize = 0;
+            for (const entry of srcset.split(",")) {
+                const parts = entry.trim().split(/\s+/);
+                if (parts.length < 1 || !parts[0]) continue;
+                const url = parts[0];
+                let size = 1;
+                if (parts[1]) {
+                    const m = parts[1].match(/^(\d+)[wx]$/i);
+                    if (m) size = parseInt(m[1], 10);
+                }
+                if (size > bestSize) {
+                    bestSize = size;
+                    best = url;
+                }
+            }
+            return best;
+        }
+
+        _looksLikeImageUrl(url) {
+            if (!url) return false;
+            try {
+                const pathname = new URL(url, window.location.href).pathname.toLowerCase();
+                return /\.(jpe?g|png|gif|webp|svg|bmp|avif|tiff)(\?|$)/i.test(pathname);
+            } catch (_) { return false; }
+        }
+
+        _toAbsolute(url) {
+            try { return new URL(url, window.location.href).href; }
+            catch (_) { return url; }
+        }
+    }
+
+    // =====================================================================
+    // DOM 监视器 —— 检测页面动态变化（灯箱/模态框/覆盖层等）
+    // =====================================================================
+    class DOMWatcher {
+        /**
+         * @param {Function} callback 当检测到显著 DOM 变化时调用
+         */
+        constructor(callback) {
+            this._callback = callback;
+            this._observer = null;
+            this._debounceTimer = null;
+            this._lastNotify = 0;
+        }
+
+        /** 开始监视 DOM 变化 */
+        start() {
+            if (this._observer) return;
+            const target = document.body || document.documentElement;
+            if (!target) {
+                warn("DOM 监视器：无法找到监视目标");
+                return;
+            }
+            try {
+                this._observer = new MutationObserver((mutations) => {
+                    if (this._isSignificantChange(mutations)) {
+                        this._debouncedNotify();
+                    }
+                });
+                this._observer.observe(target, {
+                    childList: true,
+                    subtree: true,
+                    attributes: true,
+                    attributeFilter: ['style', 'class', 'src', 'data-src', 'srcset'],
+                });
+                log("DOM 监视器已启动");
+            } catch (e) {
+                warn("DOM 监视器启动失败:", e);
+            }
+        }
+
+        /**
+         * 判断一组 DOM 变化是否"显著"——是否可能影响最佳下载图片。
+         * 仅关注：新增图片/覆盖层、图片 src 变化、覆盖层显隐。
+         */
+        _isSignificantChange(mutations) {
+            for (const m of mutations) {
+                // 新增节点：检查是否包含图片或是覆盖层
+                if (m.type === 'childList') {
+                    for (const node of m.addedNodes) {
+                        if (node.nodeType !== 1) continue;
+                        // 跳过脚本自身的 UI 元素
+                        if ((node.tagName || '').toLowerCase() === 'ws-root') continue;
+                        // 新增了图片相关元素
+                        if (node.tagName === 'IMG' || node.querySelector?.('img')) return true;
+                        if (node.tagName === 'PICTURE' || node.tagName === 'VIDEO') return true;
+                        // 新增了可能是覆盖层的元素
+                        try {
+                            const style = getComputedStyle(node);
+                            if ((style.position === 'fixed' || style.position === 'absolute') &&
+                                (parseInt(style.zIndex, 10) || 0) >= 50) {
+                                return true;
+                            }
+                        } catch (_) { }
+                        // 检查 role/class 是否暗示对话框/灯箱
+                        const role = (node.getAttribute?.('role') || '').toLowerCase();
+                        if (role === 'dialog') return true;
+                        const cls = (typeof node.className === 'string' ? node.className : '').toLowerCase();
+                        if (/lightbox|fancybox|modal|overlay|viewer|gallery|image.?view/i.test(cls)) return true;
+                    }
+                }
+
+                // 属性变化：检查 src 变化或样式变化（可能是覆盖层显隐）
+                if (m.type === 'attributes') {
+                    const el = m.target;
+                    // 跳过脚本自身的 UI 元素
+                    if ((el.tagName || '').toLowerCase() === 'ws-root') continue;
+                    if (el.tagName === 'IMG' && (m.attributeName === 'src' || m.attributeName === 'srcset')) return true;
+                    if (m.attributeName === 'style' || m.attributeName === 'class') {
+                        try {
+                            const style = getComputedStyle(el);
+                            if ((style.position === 'fixed' || style.position === 'absolute') &&
+                                (parseInt(style.zIndex, 10) || 0) >= 50) {
+                                return true;
+                            }
+                        } catch (_) { }
+                        const role = (el.getAttribute?.('role') || '').toLowerCase();
+                        if (role === 'dialog') return true;
+                        const cls = (typeof el.className === 'string' ? el.className : '').toLowerCase();
+                        if (/lightbox|fancybox|modal|overlay|viewer|gallery|image.?view/i.test(cls)) return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        /** 防抖通知——在变化平息后触发回调，最小间隔 300ms */
+        _debouncedNotify() {
+            clearTimeout(this._debounceTimer);
+            this._debounceTimer = setTimeout(() => {
+                const now = Date.now();
+                if (now - this._lastNotify < 300) return;
+                this._lastNotify = now;
+                try {
+                    this._callback();
+                } catch (e) {
+                    warn("DOM 变化回调异常:", e);
+                }
+            }, 200);
+        }
+
+        /** 停止监视 */
+        stop() {
+            if (this._observer) {
+                this._observer.disconnect();
+                this._observer = null;
+            }
+            clearTimeout(this._debounceTimer);
         }
     }
 
@@ -254,13 +795,14 @@
     class Settings {
         static DEFAULTS = {
             saveMode: "single",
-            sortBy: "size",
+            sortBy: "relevance",
             imageFormat: "original",
             nameTemplate: "{yyyy}-{mm}-{dd}-{hh}{MM}{ss}",
             defaultSavePath: "",
             domainPaths: {},
             conflictAction: "uniquify",
-            duplicateAction: "skip",        // 'skip' | 'latest'
+            duplicateAction: "skip",         // 'skip' | 'latest'
+            domainExcludes: {},             // { "domain": "pattern1\npattern2" }
             minImageSize: MIN_IMAGE_SIZE_DEFAULT,
             firstRun: true,
         };
@@ -297,6 +839,14 @@
             const domain = window.location.hostname;
             const dp = this._data.domainPaths || {};
             return normalizePath(dp[domain] || this._data.defaultSavePath || "");
+        }
+
+        /** 获取当前域名的 URL 排除模式列表 */
+        getExcludePatterns() {
+            const domain = window.location.hostname;
+            const de = this._data.domainExcludes || {};
+            const raw = de[domain] || '';
+            return raw.split('\n').map(p => p.trim()).filter(p => p.length > 0);
         }
 
         reset() {
@@ -345,7 +895,11 @@
     // 图片收集
     // =====================================================================
     class ImageCollector {
-        constructor(settings) { this.settings = settings; }
+        constructor(settings) {
+            this.settings = settings;
+            this.scorer = new ImageScorer();
+            this.resolver = new OriginalUrlResolver();
+        }
 
         collect() {
             const images = [];
@@ -401,12 +955,33 @@
                 images.push({ url, width: w, height: h, area: w * h, element: video, domIndex: 300000 + idx, type: "poster" });
             });
 
+            // 5. URL 排除过滤
+            const excludePatterns = this.settings.getExcludePatterns();
+            if (excludePatterns.length > 0) {
+                for (let i = images.length - 1; i >= 0; i--) {
+                    if (excludePatterns.some(p => urlMatchesGlob(images[i].url, p))) {
+                        log("URL 排除:", images[i].url.substring(0, 80));
+                        images.splice(i, 1);
+                    }
+                }
+            }
+
+            // 6. 评分 & 原图 URL 解析
+            this.scorer.scoreAll(images);
+            for (const img of images) {
+                img.originalUrl = this.resolver.resolve(img);
+                if (img.originalUrl !== img.url) {
+                    log("发现原图:", img.originalUrl.substring(0, 80), "←", img.url.substring(0, 60));
+                }
+            }
+
             log(`收集到 ${images.length} 张图片`);
             return images;
         }
 
         sort(images) {
             const sortBy = this.settings.get("sortBy");
+            if (sortBy === "relevance") return [...images].sort((a, b) => (b.score || 0) - (a.score || 0));
             if (sortBy === "size") return [...images].sort((a, b) => b.area - a.area);
             return [...images].sort((a, b) => a.domIndex - b.domIndex);
         }
@@ -440,11 +1015,15 @@
 
             for (let i = 0; i < images.length; i++) {
                 const image = images[i];
+                const downloadSrc = image.originalUrl || image.url;
+                if (downloadSrc !== image.url) {
+                    log("使用原图 URL:", downloadSrc.substring(0, 80));
+                }
 
                 // —— 基于内容哈希的重复检测 ——
                 let hash = null;
                 try {
-                    hash = await computeImageHash(image.url);
+                    hash = await computeImageHash(downloadSrc);
                 } catch (e) {
                     warn("哈希计算失败:", e.message);
                 }
@@ -459,7 +1038,7 @@
                     // 'latest' → 继续下载
                 }
 
-                let ext = getExtFromUrl(image.url);
+                let ext = getExtFromUrl(downloadSrc);
                 if (format !== "original") ext = format;
 
                 let filename = this.fileNamer.generate({ index: i + 1, ext });
@@ -475,9 +1054,9 @@
                     continue;
                 }
 
-                let downloadUrl = image.url;
+                let downloadUrl = downloadSrc;
                 if (format !== "original") {
-                    try { downloadUrl = await this._convertImage(image.url, format); }
+                    try { downloadUrl = await this._convertImage(downloadSrc, format); }
                     catch (e) { warn("格式转换失败，使用原格式:", e); }
                 }
 
@@ -486,7 +1065,7 @@
                     this._sessionNames.add(fullPath);
                     // 持久化哈希记录
                     if (hash) {
-                        this.hashStore.set(hash, { filename: fullPath, url: image.url });
+                        this.hashStore.set(hash, { filename: fullPath, url: downloadSrc });
                     }
                     results.push({ filename: fullPath, status: "success" });
                     log("已保存:", fullPath);
@@ -569,6 +1148,10 @@
             this._highlightStyleInjected = false;
             this._host = null;
             this._shadow = null;
+            this._imgDownloadBtn = null;
+            this._hoveredImg = null;
+            this._hoverHideTimer = null;
+            this._onSaveSingle = null;
         }
 
         init() {
@@ -576,6 +1159,7 @@
             this._injectGlobalCSS();
             this._createToastContainer();
             this._createFab();
+            this._initImageHoverDownload();
             log("UI 已初始化 (Shadow DOM)");
         }
 
@@ -883,6 +1467,101 @@
 
         setSaveHandler(fn) { this._onSave = fn; }
         setCollectHandler(fn) { this._onCollect = fn; }
+        setSaveSingleHandler(fn) { this._onSaveSingle = fn; }
+
+        // ---- 图片悬停下载按钮 ----
+        _initImageHoverDownload() {
+            const btn = document.createElement("button");
+            this._s(btn, {
+                'position': 'fixed',
+                'width': '28px',
+                'height': '28px',
+                'border-radius': '50%',
+                'border': 'none',
+                'background': 'rgba(76,175,80,0.85)',
+                'background-color': 'rgba(76,175,80,0.85)',
+                'color': '#fff',
+                'font-size': '14px',
+                'line-height': '28px',
+                'text-align': 'center',
+                'cursor': 'pointer',
+                'z-index': '2147483647',
+                'pointer-events': 'auto',
+                'box-shadow': '0 2px 6px rgba(0,0,0,.3)',
+                'display': 'none',
+                'align-items': 'center',
+                'justify-content': 'center',
+                'padding': '0',
+                'margin': '0',
+                'box-sizing': 'border-box',
+                'transition': 'transform .15s, background .15s',
+                'font-family': '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+                'user-select': 'none',
+            });
+            btn.textContent = "⬇";
+            btn.title = "下载此图片";
+
+            btn.addEventListener("mouseenter", () => {
+                clearTimeout(this._hoverHideTimer);
+                this._s(btn, { 'transform': 'scale(1.15)', 'background': 'rgba(67,160,71,1)' });
+            });
+            btn.addEventListener("mouseleave", () => {
+                this._s(btn, { 'transform': 'scale(1)', 'background': 'rgba(76,175,80,0.85)' });
+                this._hoverHideTimer = setTimeout(() => this._hideDownloadBtn(), 200);
+            });
+            btn.addEventListener("click", (e) => {
+                e.stopPropagation();
+                e.preventDefault();
+                if (this._hoveredImg && this._onSaveSingle) {
+                    this._onSaveSingle(this._hoveredImg);
+                }
+            });
+
+            this._shadow.appendChild(btn);
+            this._imgDownloadBtn = btn;
+
+            // 事件委托：监听页面图片的鼠标悬停
+            document.addEventListener("mouseover", (e) => {
+                const img = e.target;
+                if (!img || img.tagName !== 'IMG') return;
+                if (img.closest?.('ws-root')) return;
+                const rect = img.getBoundingClientRect();
+                if (rect.width < 80 || rect.height < 80) return;
+                clearTimeout(this._hoverHideTimer);
+                this._hoveredImg = img;
+                this._showDownloadBtn(rect);
+            }, true);
+
+            document.addEventListener("mouseout", (e) => {
+                if (e.target && e.target.tagName === 'IMG') {
+                    this._hoverHideTimer = setTimeout(() => this._hideDownloadBtn(), 250);
+                }
+            }, true);
+        }
+
+        _showDownloadBtn(rect) {
+            if (!this._imgDownloadBtn) return;
+            this._s(this._imgDownloadBtn, {
+                'display': 'flex',
+                'top': (rect.top + 4) + 'px',
+                'left': (rect.left + 4) + 'px',
+            });
+        }
+
+        _hideDownloadBtn() {
+            if (this._imgDownloadBtn) {
+                this._s(this._imgDownloadBtn, { 'display': 'none' });
+            }
+            this._hoveredImg = null;
+        }
+
+        /** 刷新预览面板（如果正在显示），用于 DOM 变化后更新 */
+        refreshPreview() {
+            if (this._previewEl) {
+                this._hidePreview();
+                this._showPreview();
+            }
+        }
 
         // ---- Toast ----
         toast(message, type = "info", duration = 3000) {
@@ -954,6 +1633,7 @@
             const data = this.settings.getAll();
             const domain = window.location.hostname;
             const domainPath = (data.domainPaths || {})[domain] || "";
+            const domainExclude = (data.domainExcludes || {})[domain] || "";
 
             // 全屏遮罩层
             const overlay = document.createElement("div");
@@ -1012,7 +1692,8 @@
                 }
                 #${panelId} input[type="text"],
                 #${panelId} input[type="number"],
-                #${panelId} select {
+                #${panelId} select,
+                #${panelId} textarea {
                     width: 100% !important; padding: 7px 10px !important;
                     border: 1px solid #d0d0d0 !important; border-radius: 6px !important;
                     font-size: 13px !important; box-sizing: border-box !important;
@@ -1020,7 +1701,11 @@
                     margin: 0 !important; height: auto !important; line-height: 1.4 !important;
                     appearance: auto !important; -webkit-appearance: auto !important;
                 }
-                #${panelId} input:focus, #${panelId} select:focus {
+                #${panelId} textarea {
+                    font-family: 'Cascadia Code', 'Fira Code', Consolas, monospace !important;
+                    resize: vertical !important;
+                }
+                #${panelId} input:focus, #${panelId} select:focus, #${panelId} textarea:focus {
                     border-color: #4CAF50 !important;
                 }
                 #${panelId} .ws-radio-group {
@@ -1075,9 +1760,11 @@
 
                 <label>排序方式</label>
                 <div class="ws-radio-group">
+                    <label><input type="radio" name="ws-sortBy" value="relevance" ${data.sortBy === "relevance" ? "checked" : ""}> 智能推荐</label>
                     <label><input type="radio" name="ws-sortBy" value="size" ${data.sortBy === "size" ? "checked" : ""}> 尺寸（从大到小）</label>
                     <label><input type="radio" name="ws-sortBy" value="time" ${data.sortBy === "time" ? "checked" : ""}> 页面顺序</label>
                 </div>
+                <div class="ws-hint">智能推荐：综合可见性、位置、语义上下文和分辨率，自动识别页面主图</div>
 
                 <label>图片格式</label>
                 <select id="ws-imageFormat">
@@ -1094,6 +1781,10 @@
 
                 <label>当前域名 <b>${domain}</b> 的保存路径</label>
                 <input type="text" id="ws-domainPath" value="${domainPath}" placeholder="留空则使用默认路径">
+
+                <label>当前域名 <b>${domain}</b> 的 URL 排除模式</label>
+                <textarea id="ws-domainExclude" rows="3" placeholder="每行一个模式，使用 * 匹配任意字符&#10;例如: users/*/content*">${domainExclude}</textarea>
+                <div class="ws-hint">匹配的图片 URL 路径将被排除，不参与收集和下载。* 匹配任意字符。</div>
 
                 <label>文件冲突处理</label>
                 <div class="ws-radio-group">
@@ -1180,6 +1871,12 @@
                 else { delete domainPaths[domain]; }
                 newData.domainPaths = domainPaths;
 
+                const domainExcludes = { ...(this.settings.get("domainExcludes") || {}) };
+                const de = panel.querySelector("#ws-domainExclude").value.trim();
+                if (de) { domainExcludes[domain] = de; }
+                else { delete domainExcludes[domain]; }
+                newData.domainExcludes = domainExcludes;
+
                 this.settings.setAll(newData);
                 this.hideSettings();
                 this.toast("设置已保存", "success");
@@ -1227,12 +1924,56 @@
                 const all = this.collector.collect();
                 return this.collector.select(all);
             });
+            this.ui.setSaveSingleHandler((imgEl) => this.saveSingleImage(imgEl));
 
             this._bindHotkeys();
             this._registerMenu();
             this._checkFirstRun();
 
+            // 启动 DOM 监视器，自动检测灯箱/模态框/覆盖层等页面动态变化
+            this._domWatcher = new DOMWatcher(() => this._onDomChange());
+            this._domWatcher.start();
+
             log("初始化完成。按 Ctrl+Alt+I 保存图片，或点击右下角 📷 按钮。");
+        }
+
+        /** DOM 发生显著变化时调用 —— 刷新预览面板，使评分保持最新 */
+        _onDomChange() {
+            log("检测到页面动态变化（可能出现灯箱/模态框）");
+            this.ui.refreshPreview();
+        }
+
+        /** 保存单张指定图片（由页面上的悬停下载按钮触发） */
+        async saveSingleImage(imgEl) {
+            if (!imgEl) return;
+            const url = imgEl.currentSrc || imgEl.src;
+            if (!url) {
+                this.ui.toast("未找到图片 URL", "error");
+                return;
+            }
+            const imageInfo = {
+                url,
+                width: imgEl.naturalWidth || imgEl.width,
+                height: imgEl.naturalHeight || imgEl.height,
+                area: (imgEl.naturalWidth || imgEl.width) * (imgEl.naturalHeight || imgEl.height),
+                element: imgEl,
+                type: 'img',
+            };
+            imageInfo.originalUrl = this.collector.resolver.resolve(imageInfo);
+
+            log("单张下载:", (imageInfo.originalUrl || url).substring(0, 80));
+            this.ui.highlightImages([imageInfo]);
+            this.ui.toast(`正在下载图片...`, "info", 2000);
+
+            const results = await this.saver.save([imageInfo]);
+            const r = results[0];
+            if (r.status === "success") {
+                this.ui.toast(`✓ 已保存: ${r.filename}`, "success", 3000);
+            } else if (r.status === "skipped-dup") {
+                this.ui.toast(`⊘ 重复图片已跳过`, "info", 3000);
+            } else if (r.status === "error") {
+                this.ui.toast(`✗ 下载失败: ${r.error}`, "error", 4000);
+            }
         }
 
         /** 绑定快捷键 —— 简洁且健壮 */

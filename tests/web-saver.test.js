@@ -98,11 +98,12 @@ class MockSettings {
     constructor(overrides = {}) {
         this._data = {
             saveMode: "single",
-            sortBy: "size",
+            sortBy: "relevance",
             imageFormat: "original",
             nameTemplate: "{yyyy}-{mm}-{dd}-{hh}{MM}{ss}",
             defaultSavePath: "",
             domainPaths: {},
+            domainExcludes: {},
             conflictAction: "uniquify",
             duplicateAction: "skip",
             minImageSize: 50,
@@ -119,12 +120,17 @@ class MockSettings {
         const raw = dp["example.com"] || this._data.defaultSavePath || "";
         return normalizePath(raw);
     }
+    getExcludePatterns() {
+        const de = this._data.domainExcludes || {};
+        const raw = de["example.com"] || '';
+        return raw.split('\n').map(p => p.trim()).filter(p => p.length > 0);
+    }
     reset() {
         this._data = {
-            saveMode: "single", sortBy: "size", imageFormat: "original",
+            saveMode: "single", sortBy: "relevance", imageFormat: "original",
             nameTemplate: "{yyyy}-{mm}-{dd}-{hh}{MM}{ss}", defaultSavePath: "",
-            domainPaths: {}, conflictAction: "uniquify", duplicateAction: "skip",
-            minImageSize: 50, firstRun: true,
+            domainPaths: {}, domainExcludes: {}, conflictAction: "uniquify",
+            duplicateAction: "skip", minImageSize: 50, firstRun: true,
         };
     }
 }
@@ -173,7 +179,14 @@ function sortByTime(images) {
 }
 
 function selectImages(images, mode, sortBy) {
-    const sorted = sortBy === "size" ? sortBySize(images) : sortByTime(images);
+    let sorted;
+    if (sortBy === "relevance") {
+        sorted = [...images].sort((a, b) => (b.score || 0) - (a.score || 0));
+    } else if (sortBy === "size") {
+        sorted = sortBySize(images);
+    } else {
+        sorted = sortByTime(images);
+    }
     if (mode === "single") return sorted.length > 0 ? [sorted[0]] : [];
     return sorted;
 }
@@ -304,7 +317,7 @@ describe("Settings (MockSettings)", () => {
     it("应有正确的默认值", () => {
         const s = new MockSettings();
         assertEqual(s.get("saveMode"), "single");
-        assertEqual(s.get("sortBy"), "size");
+        assertEqual(s.get("sortBy"), "relevance");
         assertEqual(s.get("conflictAction"), "uniquify");
         assertEqual(s.get("duplicateAction"), "skip");
     });
@@ -831,19 +844,19 @@ describe("健壮性", () => {
     });
     it("Settings 应能处理 null 存储数据", () => {
         const s = new MockSettings();
-        assertEqual(s.get("sortBy"), "size");
+        assertEqual(s.get("sortBy"), "relevance");
     });
     it("Settings 应将部分数据与默认值合并", () => {
         const s = new MockSettings({ saveMode: "multiple" });
         assertEqual(s.get("saveMode"), "multiple");
-        assertEqual(s.get("sortBy"), "size");
+        assertEqual(s.get("sortBy"), "relevance");
         assertEqual(s.get("conflictAction"), "uniquify");
     });
     it("Settings reset 应恢复所有默认值", () => {
         const s = new MockSettings({ saveMode: "multiple", sortBy: "time" });
         s.reset();
         assertEqual(s.get("saveMode"), "single");
-        assertEqual(s.get("sortBy"), "size");
+        assertEqual(s.get("sortBy"), "relevance");
     });
 });
 
@@ -897,8 +910,868 @@ describe("快捷键事件模拟", () => {
 });
 
 // =====================================================================
+// 原图 URL 解析测试
+// =====================================================================
+
+/** 简化版 OriginalUrlResolver，仅测试 URL 模式和 srcset 解析 */
+class MockOriginalUrlResolver {
+    resolve(imageInfo) {
+        const candidates = [];
+        this._fromUrlPatterns(imageInfo.url, candidates);
+        const seen = new Set([imageInfo.url]);
+        for (const c of candidates) {
+            if (c && !seen.has(c)) return c;
+        }
+        return imageInfo.url;
+    }
+
+    _fromUrlPatterns(url, out) {
+        try {
+            const u = new URL(url, "https://example.com");
+            const resizeParams = ["w", "h", "width", "height", "resize", "size", "fit", "quality", "q", "auto", "dpr", "tw", "th", "sw", "sh"];
+            let modified = false;
+            for (const p of resizeParams) {
+                if (u.searchParams.has(p)) { u.searchParams.delete(p); modified = true; }
+            }
+            if (modified) out.push(u.href);
+            const pathname = u.pathname;
+            const patterns = [
+                [/(_thumb|_small|_medium|_s|_m|_t)(\.[a-z]+)$/i, "$2"],
+                [/\/thumb(nail)?s?\//i, "/originals/"],
+                [/\/resize\/\d+x?\d*\//i, "/"],
+                [/-\d+x\d+(\.[a-z]+)$/i, "$1"],
+                [/\/[wh]_\d+(?:,[wh]_\d+)*\//gi, "/"],
+                [/\/(small|medium|thumbnail)\//i, "/large/"],
+            ];
+            for (const [regex, replacement] of patterns) {
+                if (regex.test(pathname)) {
+                    const newPath = pathname.replace(regex, replacement);
+                    if (newPath !== pathname) {
+                        const newUrl = new URL(u.href);
+                        newUrl.pathname = newPath;
+                        out.push(newUrl.href);
+                    }
+                }
+            }
+        } catch (_) { }
+    }
+
+    parseSrcsetBest(srcset) {
+        let best = null;
+        let bestSize = 0;
+        for (const entry of srcset.split(",")) {
+            const parts = entry.trim().split(/\s+/);
+            if (parts.length < 1 || !parts[0]) continue;
+            const url = parts[0];
+            let size = 1;
+            if (parts[1]) {
+                const m = parts[1].match(/^(\d+)[wx]$/i);
+                if (m) size = parseInt(m[1], 10);
+            }
+            if (size > bestSize) { bestSize = size; best = url; }
+        }
+        return best;
+    }
+}
+
+describe("OriginalUrlResolver (URL 模式解析)", () => {
+    const resolver = new MockOriginalUrlResolver();
+
+    it("应移除缩放参数 (?w=200&h=100)", () => {
+        const result = resolver.resolve({ url: "https://cdn.example.com/img.jpg?w=200&h=100&q=80" });
+        assert(!result.includes("w=200"), "应删除 w 参数");
+        assert(!result.includes("h=100"), "应删除 h 参数");
+        assert(!result.includes("q=80"), "应删除 q 参数");
+    });
+    it("应处理缩略图后缀 (_thumb.jpg → .jpg)", () => {
+        const result = resolver.resolve({ url: "https://example.com/photo_thumb.jpg" });
+        assertEqual(result, "https://example.com/photo.jpg");
+    });
+    it("应处理 _small 后缀", () => {
+        const result = resolver.resolve({ url: "https://example.com/image_small.png" });
+        assertEqual(result, "https://example.com/image.png");
+    });
+    it("应处理 WordPress 缩略图 (-200x200.jpg → .jpg)", () => {
+        const result = resolver.resolve({ url: "https://blog.example.com/wp-content/uploads/photo-300x200.jpg" });
+        assertEqual(result, "https://blog.example.com/wp-content/uploads/photo.jpg");
+    });
+    it("应处理 /thumbs/ 路径", () => {
+        const result = resolver.resolve({ url: "https://example.com/thumbs/photo.jpg" });
+        assertEqual(result, "https://example.com/originals/photo.jpg");
+    });
+    it("应处理 /thumbnails/ 路径", () => {
+        const result = resolver.resolve({ url: "https://example.com/thumbnails/photo.jpg" });
+        assertEqual(result, "https://example.com/originals/photo.jpg");
+    });
+    it("应处理 /resize/ 路径", () => {
+        const result = resolver.resolve({ url: "https://example.com/resize/200x150/photo.jpg" });
+        assertEqual(result, "https://example.com/photo.jpg");
+    });
+    it("应处理 /small/ → /large/ 路径替换", () => {
+        const result = resolver.resolve({ url: "https://example.com/small/photo.jpg" });
+        assertEqual(result, "https://example.com/large/photo.jpg");
+    });
+    it("应处理 /medium/ → /large/ 路径替换", () => {
+        const result = resolver.resolve({ url: "https://example.com/images/medium/photo.jpg" });
+        assertEqual(result, "https://example.com/images/large/photo.jpg");
+    });
+    it("无缩略图模式时应返回原 URL", () => {
+        const url = "https://example.com/images/photo.jpg";
+        assertEqual(resolver.resolve({ url }), url);
+    });
+    it("应处理复杂 URL 参数", () => {
+        const result = resolver.resolve({ url: "https://cdn.example.com/img.jpg?width=400&height=300&fit=crop&auto=format" });
+        assert(!result.includes("width="), "应删除 width");
+        assert(!result.includes("height="), "应删除 height");
+        assert(!result.includes("fit="), "应删除 fit");
+        assert(!result.includes("auto="), "应删除 auto");
+    });
+});
+
+// ---- srcset 解析 ----
+describe("srcset 解析", () => {
+    const resolver = new MockOriginalUrlResolver();
+
+    it("应选择最大宽度描述符", () => {
+        const result = resolver.parseSrcsetBest("small.jpg 300w, medium.jpg 600w, large.jpg 1200w");
+        assertEqual(result, "large.jpg");
+    });
+    it("应处理 x 描述符", () => {
+        const result = resolver.parseSrcsetBest("normal.jpg 1x, retina.jpg 2x, ultra.jpg 3x");
+        assertEqual(result, "ultra.jpg");
+    });
+    it("应处理无描述符的 srcset", () => {
+        const result = resolver.parseSrcsetBest("only-one.jpg");
+        assertEqual(result, "only-one.jpg");
+    });
+    it("应处理空 srcset", () => {
+        const result = resolver.parseSrcsetBest("");
+        assertEqual(result, null);
+    });
+    it("应处理复杂 srcset 格式", () => {
+        const result = resolver.parseSrcsetBest(" img1.jpg 400w , img2.jpg 800w , img3.jpg 1600w ");
+        assertEqual(result, "img3.jpg");
+    });
+});
+
+// ---- 图片评分（纯函数测试，无需 DOM） ----
+
+function mockResolutionScore(area) {
+    if (area >= 1000000) return 15;
+    if (area >= 500000) return 12;
+    if (area >= 250000) return 9;
+    if (area >= 100000) return 6;
+    if (area >= 40000) return 3;
+    return 0;
+}
+
+function mockContentScore(imageInfo) {
+    let score = 0;
+    const cls = (imageInfo.className || "").toLowerCase();
+    const src = (imageInfo.url || "").toLowerCase();
+    if (/\b(icon|logo|avatar|profile|badge|emoji|spinner|loading)\b/i.test(cls)) score -= 10;
+    if (/\b(icon|logo|avatar|favicon|emoji|sprite|placeholder)\b/i.test(src)) score -= 5;
+    const w = imageInfo.width || 1;
+    const h = imageInfo.height || 1;
+    const ratio = Math.max(w / h, h / w);
+    if (ratio <= 2.5) score += 4;
+    else if (ratio > 5) score -= 3;
+    if (imageInfo.type === "img") score += 3;
+    else if (imageInfo.type === "lazy") score += 2;
+    if (w >= 200 && h >= 200) score += 3;
+    if (w >= 400 && h >= 400) score += 2;
+    return Math.min(Math.max(score, 0), 15);
+}
+
+describe("图片评分 (分辨率评分)", () => {
+    it("1MP+ 应得满分 15", () => {
+        assertEqual(mockResolutionScore(1500000), 15);
+    });
+    it("500K 应得 12 分", () => {
+        assertEqual(mockResolutionScore(500000), 12);
+    });
+    it("250K 应得 9 分", () => {
+        assertEqual(mockResolutionScore(250000), 9);
+    });
+    it("100K 应得 6 分", () => {
+        assertEqual(mockResolutionScore(100000), 6);
+    });
+    it("40K 应得 3 分", () => {
+        assertEqual(mockResolutionScore(40000), 3);
+    });
+    it("小图应得 0 分", () => {
+        assertEqual(mockResolutionScore(100), 0);
+    });
+});
+
+describe("图片评分 (内容信号)", () => {
+    it("图标类名应降低评分", () => {
+        const score = mockContentScore({ url: "test.jpg", className: "icon-large", width: 300, height: 300, type: "img" });
+        assertEqual(score, 0, "图标类名应将评分降为 0");
+    });
+    it("logo URL 应降低评分", () => {
+        const score = mockContentScore({ url: "https://example.com/logo.png", className: "", width: 300, height: 300, type: "img" });
+        assert(score < 10, "logo URL 应得到较低评分");
+    });
+    it("合理宽高比应加分", () => {
+        const score = mockContentScore({ url: "test.jpg", className: "", width: 600, height: 400, type: "img" });
+        assert(score >= 10, "合理宽高比的大图应得到高分: " + score);
+    });
+    it("极端横幅应扣分", () => {
+        const banner = mockContentScore({ url: "test.jpg", className: "", width: 1200, height: 100, type: "img" });
+        const normal = mockContentScore({ url: "test.jpg", className: "", width: 600, height: 400, type: "img" });
+        assert(banner < normal, "极端横幅应得分低于正常比例");
+    });
+    it("<img> 元素应优于背景图片", () => {
+        const imgScore = mockContentScore({ url: "test.jpg", className: "", width: 300, height: 300, type: "img" });
+        const bgScore = mockContentScore({ url: "test.jpg", className: "", width: 300, height: 300, type: "bg" });
+        assert(imgScore > bgScore, "img 应得分高于 bg");
+    });
+    it("大图应得到额外加分", () => {
+        const large = mockContentScore({ url: "test.jpg", className: "", width: 800, height: 600, type: "img" });
+        const small = mockContentScore({ url: "test.jpg", className: "", width: 100, height: 80, type: "img" });
+        assert(large > small, "大图应得分高于小图");
+    });
+});
+
+// ---- 智能排序 (relevance) ----
+describe("智能排序 (relevance)", () => {
+    it("应按评分降序排列", () => {
+        const imgs = [
+            { url: "low", score: 10, area: 1000, domIndex: 0 },
+            { url: "high", score: 85, area: 500, domIndex: 1 },
+            { url: "mid", score: 50, area: 800, domIndex: 2 },
+        ];
+        const result = selectImages(imgs, "multiple", "relevance");
+        assertEqual(result[0].url, "high");
+        assertEqual(result[1].url, "mid");
+        assertEqual(result[2].url, "low");
+    });
+    it("单张模式应选择评分最高的（而非最大的）", () => {
+        const imgs = [
+            { url: "big-but-low", score: 20, area: 100000, domIndex: 0 },
+            { url: "small-but-relevant", score: 90, area: 5000, domIndex: 1 },
+        ];
+        const result = selectImages(imgs, "single", "relevance");
+        assertEqual(result.length, 1);
+        assertEqual(result[0].url, "small-but-relevant");
+    });
+    it("评分相同时应保持稳定", () => {
+        const imgs = [
+            { url: "a", score: 50, area: 100, domIndex: 0 },
+            { url: "b", score: 50, area: 200, domIndex: 1 },
+        ];
+        const result = selectImages(imgs, "single", "relevance");
+        assertEqual(result.length, 1);
+        // 两者分数相同，稳定排序保持原顺序
+        assert(result[0].url === "a" || result[0].url === "b", "应选择其中之一");
+    });
+    it("无评分的图片应视为 0 分", () => {
+        const imgs = [
+            { url: "no-score", area: 100, domIndex: 0 },
+            { url: "has-score", score: 30, area: 50, domIndex: 1 },
+        ];
+        const result = selectImages(imgs, "single", "relevance");
+        assertEqual(result[0].url, "has-score");
+    });
+    it("空数组应返回空", () => {
+        assertEqual(selectImages([], "single", "relevance").length, 0);
+    });
+});
+
+// ---- originalUrl 集成测试 ----
+describe("originalUrl 集成测试", () => {
+    const resolver = new MockOriginalUrlResolver();
+
+    it("应在完整流水线中使用原图 URL", () => {
+        const images = [
+            { url: "https://cdn.example.com/photo_thumb.jpg", area: 1000, domIndex: 0, score: 80 },
+        ];
+        for (const img of images) {
+            img.originalUrl = resolver.resolve(img);
+        }
+        assertEqual(images[0].originalUrl, "https://cdn.example.com/photo.jpg");
+    });
+    it("无原图时应保持原 URL", () => {
+        const img = { url: "https://example.com/clean-photo.jpg" };
+        assertEqual(resolver.resolve(img), img.url);
+    });
+    it("应优先使用评分最高图片的原图", () => {
+        const images = [
+            { url: "https://example.com/big_thumb.jpg", area: 100000, domIndex: 0, score: 30 },
+            { url: "https://example.com/hero_thumb.jpg", area: 50000, domIndex: 1, score: 85 },
+        ];
+        for (const img of images) {
+            img.originalUrl = resolver.resolve(img);
+        }
+        const selected = selectImages(images, "single", "relevance");
+        assertEqual(selected[0].url, "https://example.com/hero_thumb.jpg");
+        assertEqual(selected[0].originalUrl, "https://example.com/hero.jpg");
+    });
+});
+
+// =====================================================================
+// 覆盖层与遮挡检测测试
+// =====================================================================
+
+/**
+ * 模拟 ImageScorer._overlayBonus 的纯逻辑
+ * ancestors: 祖先元素信息数组 [{ position, zIndex, width, height, role, tag, open }]
+ * vpWidth/vpHeight: 视口尺寸
+ */
+function mockOverlayBonus(ancestors, vpWidth = 1920, vpHeight = 1080) {
+    let score = 0;
+    for (const a of ancestors) {
+        const pos = a.position || '';
+        const zIndex = a.zIndex || 0;
+        const width = a.width || 0;
+        const height = a.height || 0;
+
+        if ((pos === 'fixed' || pos === 'absolute') && zIndex >= 100) {
+            const coversViewport = width >= vpWidth * 0.5 && height >= vpHeight * 0.5;
+            if (coversViewport) {
+                score = Math.max(score, zIndex >= 1000 ? 20 : 15);
+            } else {
+                score = Math.max(score, 10);
+            }
+        }
+
+        if (a.role === 'dialog') score = Math.max(score, 15);
+        if (a.tag === 'dialog' && a.open) score = Math.max(score, 15);
+    }
+    return Math.min(score, 20);
+}
+
+/**
+ * 模拟 ImageScorer._occlusionPenalty 的纯逻辑
+ * isVisible: 图片中心是否为顶层可见
+ * hasSize: 图片是否有非零尺寸
+ */
+function mockOcclusionPenalty(isVisible, hasSize = true) {
+    if (!hasSize) return 20;
+    if (isVisible) return 0;
+    return 20;
+}
+
+describe("覆盖层加成 (_overlayBonus)", () => {
+    it("无覆盖层祖先应得 0 分", () => {
+        assertEqual(mockOverlayBonus([]), 0);
+    });
+
+    it("普通定位祖先（无高 z-index）应得 0 分", () => {
+        assertEqual(mockOverlayBonus([
+            { position: 'relative', zIndex: 1, width: 800, height: 600 },
+        ]), 0);
+    });
+
+    it("低 z-index 的 absolute 祖先应得 0 分", () => {
+        assertEqual(mockOverlayBonus([
+            { position: 'absolute', zIndex: 50, width: 1920, height: 1080 },
+        ]), 0);
+    });
+
+    it("高 z-index fixed 全屏覆盖层应得 15 分", () => {
+        assertEqual(mockOverlayBonus([
+            { position: 'fixed', zIndex: 500, width: 1920, height: 1080 },
+        ]), 15);
+    });
+
+    it("超高 z-index (≥1000) 全屏覆盖层应得 20 分", () => {
+        assertEqual(mockOverlayBonus([
+            { position: 'fixed', zIndex: 9999, width: 1920, height: 1080 },
+        ]), 20);
+    });
+
+    it("高 z-index 但不覆盖视口应得 10 分", () => {
+        assertEqual(mockOverlayBonus([
+            { position: 'absolute', zIndex: 200, width: 400, height: 300 },
+        ]), 10);
+    });
+
+    it("role=dialog 祖先应得 15 分", () => {
+        assertEqual(mockOverlayBonus([
+            { position: 'relative', zIndex: 0, role: 'dialog' },
+        ]), 15);
+    });
+
+    it("<dialog open> 元素应得 15 分", () => {
+        assertEqual(mockOverlayBonus([
+            { tag: 'dialog', open: true },
+        ]), 15);
+    });
+
+    it("<dialog> 未打开不应加分", () => {
+        assertEqual(mockOverlayBonus([
+            { tag: 'dialog', open: false },
+        ]), 0);
+    });
+
+    it("多层嵌套应取最高分", () => {
+        assertEqual(mockOverlayBonus([
+            { position: 'fixed', zIndex: 100, width: 1920, height: 1080 },    // 15
+            { position: 'fixed', zIndex: 9999, width: 1920, height: 1080 },   // 20
+        ]), 20);
+    });
+
+    it("最大值应被限制为 20", () => {
+        assertEqual(mockOverlayBonus([
+            { position: 'fixed', zIndex: 99999, width: 1920, height: 1080 },
+            { role: 'dialog' },
+        ]), 20);
+    });
+});
+
+describe("遮挡惩罚 (_occlusionPenalty)", () => {
+    it("可见图片不应被惩罚", () => {
+        assertEqual(mockOcclusionPenalty(true), 0);
+    });
+
+    it("被遮挡的图片应扣 20 分", () => {
+        assertEqual(mockOcclusionPenalty(false), 20);
+    });
+
+    it("零尺寸图片应扣 20 分", () => {
+        assertEqual(mockOcclusionPenalty(true, false), 20);
+    });
+});
+
+// ---- 覆盖层场景下的选择集成测试 ----
+describe("覆盖层场景集成测试", () => {
+    it("灯箱中的图片应优于背景中的同类图片", () => {
+        // 模拟场景：页面有画廊缩略图 + 打开的灯箱大图
+        const bgImage = { url: "bg-gallery.jpg", score: 45, area: 50000, domIndex: 0 };
+        const lightboxImage = { url: "lightbox-hero.jpg", score: 75, area: 200000, domIndex: 1 };
+        // 灯箱图片得分更高（包含覆盖层加成 + 未被遮挡）
+        const selected = selectImages([bgImage, lightboxImage], "single", "relevance");
+        assertEqual(selected[0].url, "lightbox-hero.jpg");
+    });
+
+    it("被遮挡的背景图应被惩罚后排名靠后", () => {
+        // 背景图原本高分，但被覆盖层遮挡后扣分
+        const occludedImg = { url: "occluded.jpg", score: 60 - 20, area: 100000, domIndex: 0 }; // 60原分 - 20遮挡
+        const overlayImg = { url: "overlay.jpg", score: 50 + 20, area: 80000, domIndex: 1 };    // 50原分 + 20覆盖层加成
+        const selected = selectImages([occludedImg, overlayImg], "single", "relevance");
+        assertEqual(selected[0].url, "overlay.jpg");
+    });
+
+    it("模态框关闭后图片应恢复正常评分（无覆盖层加成/遮挡）", () => {
+        // 模拟：模态框关闭，没有覆盖层
+        const img1 = { url: "main-content.jpg", score: 65, area: 200000, domIndex: 0 };
+        const img2 = { url: "sidebar-ad.jpg", score: 20, area: 50000, domIndex: 1 };
+        const selected = selectImages([img1, img2], "single", "relevance");
+        assertEqual(selected[0].url, "main-content.jpg");
+    });
+
+    it("高 z-index 灯箱小图也应优于大的背景图", () => {
+        // 灯箱中的图片即使面积较小，因覆盖层加成也应排名靠前
+        const bgLarge = { url: "bg-large.jpg", score: 25, area: 500000, domIndex: 0 };  // 大但被遮挡
+        const overlaySmall = { url: "overlay-small.jpg", score: 55, area: 100000, domIndex: 1 }; // 覆盖层内
+        const selected = selectImages([bgLarge, overlaySmall], "single", "relevance");
+        assertEqual(selected[0].url, "overlay-small.jpg");
+    });
+});
+
+// ---- DOMWatcher 变化检测逻辑测试 ----
+
+/**
+ * 模拟 DOMWatcher._isSignificantChange 的判断逻辑
+ * change: { type, tag?, class?, role?, position?, zIndex?, attributeName? }
+ */
+function mockIsSignificantChange(changes) {
+    for (const c of changes) {
+        if (c.type === 'childList') {
+            if (c.tag === 'ws-root') continue;
+            if (c.tag === 'IMG' || c.hasImgChild) return true;
+            if (c.tag === 'PICTURE' || c.tag === 'VIDEO') return true;
+            if ((c.position === 'fixed' || c.position === 'absolute') && (c.zIndex || 0) >= 50) return true;
+            if (c.role === 'dialog') return true;
+            if (/lightbox|fancybox|modal|overlay|viewer|gallery|image.?view/i.test(c.class || '')) return true;
+        }
+        if (c.type === 'attributes') {
+            if (c.tag === 'ws-root') continue;
+            if (c.tag === 'IMG' && (c.attributeName === 'src' || c.attributeName === 'srcset')) return true;
+            if (c.attributeName === 'style' || c.attributeName === 'class') {
+                if ((c.position === 'fixed' || c.position === 'absolute') && (c.zIndex || 0) >= 50) return true;
+                if (c.role === 'dialog') return true;
+                if (/lightbox|fancybox|modal|overlay|viewer|gallery|image.?view/i.test(c.class || '')) return true;
+            }
+        }
+    }
+    return false;
+}
+
+describe("DOMWatcher 变化检测逻辑", () => {
+    it("新增 IMG 元素应被检测", () => {
+        assert(mockIsSignificantChange([{ type: 'childList', tag: 'IMG' }]));
+    });
+
+    it("新增包含 IMG 子元素的容器应被检测", () => {
+        assert(mockIsSignificantChange([{ type: 'childList', tag: 'DIV', hasImgChild: true }]));
+    });
+
+    it("新增 PICTURE 元素应被检测", () => {
+        assert(mockIsSignificantChange([{ type: 'childList', tag: 'PICTURE' }]));
+    });
+
+    it("新增 VIDEO 元素应被检测", () => {
+        assert(mockIsSignificantChange([{ type: 'childList', tag: 'VIDEO' }]));
+    });
+
+    it("新增高 z-index fixed 元素应被检测", () => {
+        assert(mockIsSignificantChange([{
+            type: 'childList', tag: 'DIV', position: 'fixed', zIndex: 100,
+        }]));
+    });
+
+    it("新增 role=dialog 元素应被检测", () => {
+        assert(mockIsSignificantChange([{
+            type: 'childList', tag: 'DIV', role: 'dialog',
+        }]));
+    });
+
+    it("新增带 lightbox 类名的元素应被检测", () => {
+        assert(mockIsSignificantChange([{
+            type: 'childList', tag: 'DIV', class: 'photo-lightbox-container',
+        }]));
+    });
+
+    it("新增带 modal 类名的元素应被检测", () => {
+        assert(mockIsSignificantChange([{
+            type: 'childList', tag: 'DIV', class: 'my-modal-wrapper',
+        }]));
+    });
+
+    it("新增带 viewer 类名的元素应被检测", () => {
+        assert(mockIsSignificantChange([{
+            type: 'childList', tag: 'DIV', class: 'image-viewer',
+        }]));
+    });
+
+    it("新增 ws-root 元素应被忽略", () => {
+        assert(!mockIsSignificantChange([{ type: 'childList', tag: 'ws-root' }]));
+    });
+
+    it("新增普通 DIV（无图片/覆盖层）应被忽略", () => {
+        assert(!mockIsSignificantChange([{
+            type: 'childList', tag: 'DIV', class: 'footer-text',
+        }]));
+    });
+
+    it("IMG src 属性变化应被检测", () => {
+        assert(mockIsSignificantChange([{
+            type: 'attributes', tag: 'IMG', attributeName: 'src',
+        }]));
+    });
+
+    it("IMG srcset 属性变化应被检测", () => {
+        assert(mockIsSignificantChange([{
+            type: 'attributes', tag: 'IMG', attributeName: 'srcset',
+        }]));
+    });
+
+    it("覆盖层 style 属性变化应被检测", () => {
+        assert(mockIsSignificantChange([{
+            type: 'attributes', tag: 'DIV', attributeName: 'style',
+            position: 'fixed', zIndex: 100,
+        }]));
+    });
+
+    it("非覆盖层的 style 变化应被忽略", () => {
+        assert(!mockIsSignificantChange([{
+            type: 'attributes', tag: 'DIV', attributeName: 'style',
+            position: 'relative', zIndex: 1,
+        }]));
+    });
+
+    it("dialog class 变化应被检测", () => {
+        assert(mockIsSignificantChange([{
+            type: 'attributes', tag: 'DIV', attributeName: 'class',
+            role: 'dialog',
+        }]));
+    });
+
+    it("gallery class 变化应被检测", () => {
+        assert(mockIsSignificantChange([{
+            type: 'attributes', tag: 'DIV', attributeName: 'class',
+            class: 'swiper-gallery',
+        }]));
+    });
+
+    it("ws-root 属性变化应被忽略", () => {
+        assert(!mockIsSignificantChange([{
+            type: 'attributes', tag: 'ws-root', attributeName: 'style',
+        }]));
+    });
+});
+
+// ---- 防抖逻辑（纯函数测试）----
+describe("防抖逻辑", () => {
+    it("短时间内多次调用应合并为一次", () => {
+        let callCount = 0;
+        let lastNotify = 0;
+        const MIN_INTERVAL = 300;
+        function tryNotify() {
+            const now = Date.now();
+            if (now - lastNotify < MIN_INTERVAL) return;
+            lastNotify = now;
+            callCount++;
+        }
+        // 同一时刻连续调用 5 次
+        for (let i = 0; i < 5; i++) tryNotify();
+        assertEqual(callCount, 1, "瞬时连续调用应只触发 1 次");
+    });
+
+    it("超过最小间隔后应允许再次触发", () => {
+        let callCount = 0;
+        let lastNotify = 0;
+        const MIN_INTERVAL = 300;
+        function tryNotify(now) {
+            if (now - lastNotify < MIN_INTERVAL) return;
+            lastNotify = now;
+            callCount++;
+        }
+        tryNotify(1000);   // 第 1 次
+        tryNotify(1100);   // 被跳过（间隔 100ms < 300ms）
+        tryNotify(1400);   // 第 2 次（间隔 400ms > 300ms）
+        assertEqual(callCount, 2, "超过间隔后应再次触发");
+    });
+});
+
+// =====================================================================
 // 测试结果汇总
 // =====================================================================
+
+// ---- urlMatchesGlob ----
+function urlMatchesGlob(url, pattern) {
+    if (!url || !pattern) return false;
+    try {
+        const pathname = new URL(url, 'https://example.com').pathname;
+        const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
+        const regexStr = escaped.replace(/\*/g, '.*');
+        return new RegExp(regexStr, 'i').test(pathname);
+    } catch (_) {
+        return false;
+    }
+}
+
+describe("urlMatchesGlob (URL 模式匹配)", () => {
+    it("应匹配简单路径模式", () => {
+        assert(urlMatchesGlob("https://example.com/users/abc/content", "users/*/content"));
+    });
+    it("应匹配多段路径（* 匹配含 / 的内容）", () => {
+        assert(urlMatchesGlob(
+            "https://grok.868986.xyz/users/7d784541-61ea-4cf3-81b9-9219325e2469/2fcc0157-bc28-4b20-ac46-6875a1e45b1f/content",
+            "users/*/content"
+        ));
+    });
+    it("应匹配尾部通配符", () => {
+        assert(urlMatchesGlob("https://example.com/users/abc/content?cache=1", "users/*/content*"));
+    });
+    it("应不匹配不相关路径", () => {
+        assert(!urlMatchesGlob("https://example.com/images/photo.jpg", "users/*/content*"));
+    });
+    it("应匹配图片路径", () => {
+        assert(urlMatchesGlob("https://example.com/imagine-public/images/photo.jpg", "images/*.jpg"));
+    });
+    it("应大小写不敏感", () => {
+        assert(urlMatchesGlob("https://example.com/Users/ABC/Content", "users/*/content"));
+    });
+    it("空参数应返回 false", () => {
+        assert(!urlMatchesGlob("", "test"));
+        assert(!urlMatchesGlob("https://example.com/test", ""));
+        assert(!urlMatchesGlob(null, "test"));
+        assert(!urlMatchesGlob("https://example.com/test", null));
+    });
+    it("应正确转义正则特殊字符", () => {
+        assert(urlMatchesGlob("https://example.com/path/file.jpg", "path/file.jpg"));
+    });
+    it("应匹配 API 端点模式", () => {
+        assert(urlMatchesGlob("https://api.example.com/v1/images/generate", "v1/images/*"));
+    });
+    it("星号应匹配空字符串", () => {
+        assert(urlMatchesGlob("https://example.com/users/content", "users/*content"));
+    });
+});
+
+// ---- URL 评分 (_urlScore) ----
+
+function mockUrlScore(url) {
+    let score = 0;
+    try {
+        const pathname = new URL(url, 'https://example.com').pathname.toLowerCase();
+        if (/\.(jpe?g|png|gif|webp|avif|bmp|tiff|svg)$/i.test(pathname)) {
+            score += 5;
+        } else if (!/\.\w{1,5}$/.test(pathname)) {
+            score -= 5;
+        }
+        if (/\/(images?|uploads?|photos?|media|gallery|pictures?|artworks?)\//i.test(pathname)) {
+            score += 3;
+        }
+        if (/\/(users?|avatars?|profiles?|accounts?)\//i.test(pathname)) {
+            score -= 5;
+        }
+        if (/\/(content|data|blob|file|thumbnail|thumb)$/i.test(pathname)) {
+            score -= 3;
+        }
+    } catch (_) { }
+    return Math.min(Math.max(score, -10), 10);
+}
+
+describe("URL 评分 (_urlScore)", () => {
+    it("有 .jpg 扩展名的 URL 应加分", () => {
+        const score = mockUrlScore("https://cdn.example.com/images/photo.jpg");
+        assert(score > 0, "应得正分: " + score);
+    });
+    it("有 .png 扩展名的 URL 应加分", () => {
+        const score = mockUrlScore("https://example.com/upload/img.png");
+        assert(score > 0, "应得正分: " + score);
+    });
+    it("无扩展名的 API 端点 URL 应扣分", () => {
+        const score = mockUrlScore("https://example.com/users/abc/content");
+        assert(score < 0, "应得负分: " + score);
+    });
+    it("/users/ 路径应扣分", () => {
+        const score = mockUrlScore("https://example.com/users/abc/avatar");
+        assert(score < 0, "应得负分: " + score);
+    });
+    it("/images/ 路径应加分", () => {
+        const score = mockUrlScore("https://cdn.example.com/images/photo.jpg");
+        assertEqual(score, 8, "应得 +5(ext) +3(images path) = 8");
+    });
+    it("干扰项 URL 应得负分", () => {
+        const score = mockUrlScore("https://grok.868986.xyz/users/7d784541/2fcc0157/content");
+        assertEqual(score, -10, "应得 -5(no ext) -5(users) 并被限制为 -10");
+    });
+    it("目标 URL 应得正分", () => {
+        const score = mockUrlScore("https://grok.868986.xyz/imagine-public/images/photo.jpg");
+        assertEqual(score, 8, "应得 +5(ext) +3(images path) = 8");
+    });
+    it("干扰项与目标的分差应显著", () => {
+        const interference = mockUrlScore("https://grok.868986.xyz/users/7d784541/2fcc0157/content");
+        const target = mockUrlScore("https://grok.868986.xyz/imagine-public/images/photo.jpg");
+        assert(target - interference >= 15, `分差应 >= 15: 目标 ${target}, 干扰 ${interference}`);
+    });
+    it("以 /content 结尾应额外扣分", () => {
+        const score = mockUrlScore("https://example.com/api/content");
+        assert(score < -5, "应得低于 -5 分: " + score);
+    });
+    it("/uploads/ 路径应加分", () => {
+        const score = mockUrlScore("https://example.com/uploads/image.webp");
+        assertEqual(score, 8, "应得 +5(ext) +3(uploads path) = 8");
+    });
+    it("普通 URL 无特殊模式应得中性分", () => {
+        const score = mockUrlScore("https://example.com/static/bg.jpg");
+        assertEqual(score, 5, "只有扩展名加分: +5");
+    });
+    it("结果应被限制在 [-10, 10] 范围内", () => {
+        const low = mockUrlScore("https://example.com/users/avatar/content");
+        assert(low >= -10, "不应低于 -10");
+        const high = mockUrlScore("https://example.com/images/uploads/photo.jpg");
+        assert(high <= 10, "不应高于 10");
+    });
+});
+
+// ---- URL 排除过滤集成测试 ----
+describe("URL 排除过滤集成测试", () => {
+    it("应根据排除模式过滤图片", () => {
+        const patterns = ["users/*/content*"];
+        const images = [
+            { url: "https://grok.868986.xyz/users/abc/def/content?cache=1" },
+            { url: "https://grok.868986.xyz/imagine-public/images/photo.jpg" },
+        ];
+        const filtered = images.filter(img => !patterns.some(p => urlMatchesGlob(img.url, p)));
+        assertEqual(filtered.length, 1);
+        assert(filtered[0].url.includes("photo.jpg"));
+    });
+    it("无排除模式时应保留所有图片", () => {
+        const patterns = [];
+        const images = [
+            { url: "https://example.com/a.jpg" },
+            { url: "https://example.com/b.jpg" },
+        ];
+        const filtered = images.filter(img => !patterns.some(p => urlMatchesGlob(img.url, p)));
+        assertEqual(filtered.length, 2);
+    });
+    it("多个排除模式应全部生效", () => {
+        const patterns = ["users/*", "api/*"];
+        const images = [
+            { url: "https://example.com/users/avatar.jpg" },
+            { url: "https://example.com/api/thumbnail" },
+            { url: "https://example.com/images/photo.jpg" },
+        ];
+        const filtered = images.filter(img => !patterns.some(p => urlMatchesGlob(img.url, p)));
+        assertEqual(filtered.length, 1);
+        assert(filtered[0].url.includes("photo.jpg"));
+    });
+    it("排除模式不应影响不匹配的 URL", () => {
+        const patterns = ["avatars/*"];
+        const images = [
+            { url: "https://example.com/images/photo.jpg" },
+            { url: "https://example.com/uploads/big.png" },
+        ];
+        const filtered = images.filter(img => !patterns.some(p => urlMatchesGlob(img.url, p)));
+        assertEqual(filtered.length, 2);
+    });
+});
+
+// ---- Settings domainExcludes ----
+describe("Settings domainExcludes", () => {
+    it("应返回当前域名的排除模式列表", () => {
+        const s = new MockSettings({ domainExcludes: { "example.com": "users/*/content*\napi/*" } });
+        const patterns = s.getExcludePatterns();
+        assertEqual(patterns.length, 2);
+        assertEqual(patterns[0], "users/*/content*");
+        assertEqual(patterns[1], "api/*");
+    });
+    it("无排除模式时应返回空数组", () => {
+        const s = new MockSettings();
+        assertEqual(s.getExcludePatterns().length, 0);
+    });
+    it("应忽略空行", () => {
+        const s = new MockSettings({ domainExcludes: { "example.com": "pattern1\n\n  \npattern2" } });
+        const patterns = s.getExcludePatterns();
+        assertEqual(patterns.length, 2);
+    });
+    it("应去除模式首尾空白", () => {
+        const s = new MockSettings({ domainExcludes: { "example.com": "  users/*  " } });
+        assertEqual(s.getExcludePatterns()[0], "users/*");
+    });
+    it("reset 应清除排除模式", () => {
+        const s = new MockSettings({ domainExcludes: { "example.com": "test" } });
+        s.reset();
+        assertEqual(s.getExcludePatterns().length, 0);
+    });
+});
+
+// ---- 用户场景集成测试：grok 页面 ----
+describe("用户场景：grok 页面图片选择", () => {
+    it("目标图片应优于干扰项（URL 评分差异）", () => {
+        // 模拟 grok 场景：两张图片，只有 URL 评分不同
+        const interference = {
+            url: "https://grok.868986.xyz/users/7d784541/2fcc0157/content?cache=1",
+            score: 50 + mockUrlScore("https://grok.868986.xyz/users/7d784541/2fcc0157/content"),
+            area: 10000, domIndex: 0,
+        };
+        const target = {
+            url: "https://grok.868986.xyz/imagine-public/images/180bcf62.jpg?cache=1",
+            score: 50 + mockUrlScore("https://grok.868986.xyz/imagine-public/images/180bcf62.jpg"),
+            area: 10000, domIndex: 1,
+        };
+        const selected = selectImages([interference, target], "single", "relevance");
+        assertEqual(selected[0].url, target.url, "应选择目标图片");
+    });
+    it("排除模式应过滤干扰项", () => {
+        const patterns = ["users/*/content*"];
+        const images = [
+            { url: "https://grok.868986.xyz/users/7d784541/2fcc0157/content?cache=1" },
+            { url: "https://grok.868986.xyz/imagine-public/images/180bcf62.jpg?cache=1" },
+        ];
+        const filtered = images.filter(img => !patterns.some(p => urlMatchesGlob(img.url, p)));
+        assertEqual(filtered.length, 1);
+        assert(filtered[0].url.includes("180bcf62.jpg"));
+    });
+});
+
 console.log("\n" + "=".repeat(50));
 console.log(`  结果: ${_passed} 通过, ${_failed} 失败`);
 console.log("=".repeat(50) + "\n");
