@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Auto Player — 失焦检测综合测试页面</title>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            margin: 0;
+            padding: 24px 40px;
+            background: #f5f5f5;
+            color: #333;
+        }
+
+        h1 {
+            color: #FF9800;
+            margin-bottom: 4px;
+        }
+
+        h1+p {
+            color: #777;
+            margin-top: 0;
+        }
+
+        h2 {
+            color: #555;
+            margin-top: 24px;
+            margin-bottom: 8px;
+            font-size: 18px;
+        }
+
+        .section {
+            background: #fff;
+            padding: 16px 20px;
+            border-radius: 8px;
+            margin: 12px 0;
+            box-shadow: 0 1px 4px rgba(0, 0, 0, .08);
+        }
+
+        /* --- 检测机制网格 --- */
+        .detectors {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+            gap: 12px;
+        }
+
+        .detector {
+            background: #fafafa;
+            border: 1px solid #e0e0e0;
+            border-radius: 6px;
+            padding: 12px 16px;
+        }
+
+        .detector h3 {
+            margin: 0 0 6px 0;
+            font-size: 14px;
+            color: #444;
+        }
+
+        .detector p {
+            margin: 0 0 8px 0;
+            font-size: 12px;
+            color: #888;
+        }
+
+        /* --- 状态标签 --- */
+        .badge {
+            display: inline-block;
+            padding: 2px 10px;
+            border-radius: 10px;
+            font-size: 12px;
+            font-weight: 600;
+            margin: 2px 4px 2px 0;
+        }
+
+        .badge.ok {
+            background: #E8F5E9;
+            color: #2E7D32;
+        }
+
+        .badge.warn {
+            background: #FFF3E0;
+            color: #E65100;
+        }
+
+        .badge.fail {
+            background: #FFEBEE;
+            color: #C62828;
+        }
+
+        .badge.idle {
+            background: #ECEFF1;
+            color: #607D8B;
+        }
+
+        /* --- 按钮 --- */
+        button {
+            padding: 6px 14px;
+            margin: 3px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+        }
+
+        .btn-play {
+            background: #4CAF50;
+            color: #fff;
+        }
+
+        .btn-pause {
+            background: #FF9800;
+            color: #fff;
+        }
+
+        .btn-danger {
+            background: #f44336;
+            color: #fff;
+        }
+
+        .btn-test {
+            background: #2196F3;
+            color: #fff;
+        }
+
+        .btn-sm {
+            font-size: 12px;
+            padding: 4px 10px;
+        }
+
+        /* --- 媒体 --- */
+        video,
+        audio {
+            display: block;
+            margin: 8px 0;
+            max-width: 100%;
+        }
+
+        /* --- 日志 --- */
+        #log {
+            background: #263238;
+            color: #B2FF59;
+            padding: 12px 16px;
+            border-radius: 8px;
+            font-family: "Cascadia Code", "Fira Code", monospace;
+            font-size: 12px;
+            max-height: 260px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            line-height: 1.5;
+        }
+
+        /* --- API 值 --- */
+        .api-grid {
+            display: grid;
+            grid-template-columns: auto 1fr;
+            gap: 2px 12px;
+            font-size: 13px;
+        }
+
+        .api-grid .label {
+            color: #888;
+            font-family: monospace;
+        }
+
+        .api-grid .value {
+            font-weight: 600;
+        }
+
+        /* --- 综合攻击 --- */
+        #attack-summary {
+            margin-top: 8px;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>▶ Auto Player — 失焦检测综合测试</h1>
+    <p>此页面模拟各种网站失焦检测机制。启用 Auto Player 后切换标签页，所有检测应被阻止，媒体应继续播放。</p>
+
+    <!-- ======================== 媒体播放器 ======================== -->
+    <div class="section">
+        <h2>🎬 媒体播放器</h2>
+        <div style="display:flex;gap:24px;flex-wrap:wrap;">
+            <div style="flex:1;min-width:300px;">
+                <video id="test-video" controls width="100%">
+                    <source src="https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
+                        type="video/mp4" />
+                </video>
+                <button class="btn-play" onclick="document.getElementById('test-video').play()">▶ 播放视频</button>
+                <button class="btn-pause" onclick="document.getElementById('test-video').pause()">⏸ 暂停视频</button>
+                <span id="video-status" class="badge idle">暂停</span>
+            </div>
+            <div style="flex:1;min-width:300px;">
+                <audio id="test-audio" controls style="width:100%">
+                    <source src="https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3" type="audio/mpeg" />
+                </audio>
+                <button class="btn-play" onclick="document.getElementById('test-audio').play()">▶ 播放音频</button>
+                <button class="btn-pause" onclick="document.getElementById('test-audio').pause()">⏸ 暂停音频</button>
+                <span id="audio-status" class="badge idle">暂停</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- ======================== Visibility API 状态 ======================== -->
+    <div class="section">
+        <h2>📊 Visibility API 实时状态</h2>
+        <div class="api-grid">
+            <span class="label">document.hidden</span>
+            <span class="value" id="val-hidden">--</span>
+            <span class="label">document.visibilityState</span>
+            <span class="value" id="val-state">--</span>
+            <span class="label">document.hasFocus()</span>
+            <span class="value" id="val-focus">--</span>
+            <span class="label">Document.prototype.hidden</span>
+            <span class="value" id="val-proto-hidden">--</span>
+        </div>
+        <button class="btn-test btn-sm" onclick="updateVisibility()" style="margin-top:8px">🔄 手动刷新</button>
+    </div>
+
+    <!-- ======================== 检测机制测试 ======================== -->
+    <div class="section">
+        <h2>🔍 失焦检测机制（逐项测试）</h2>
+        <p style="font-size:13px;color:#888;margin:0 0 12px 0;">
+            每个检测器独立运行。切换标签页后，如果 Auto Player 成功阻止该机制，
+            状态保持 <span class="badge ok">已阻止</span>；
+            否则变为 <span class="badge fail">检测到离开</span>。
+        </p>
+
+        <div class="detectors">
+            <!-- A: visibilitychange addEventListener -->
+            <div class="detector">
+                <h3>A. visibilitychange 事件监听</h3>
+                <p>document.addEventListener("visibilitychange", fn)</p>
+                <span id="det-A" class="badge idle">等待切换标签页</span>
+            </div>
+
+            <!-- B: document.onvisibilitychange 属性 -->
+            <div class="detector">
+                <h3>B. onvisibilitychange 属性</h3>
+                <p>document.onvisibilitychange = fn</p>
+                <span id="det-B" class="badge idle">等待切换标签页</span>
+            </div>
+
+            <!-- C: window blur addEventListener -->
+            <div class="detector">
+                <h3>C. window blur 事件监听</h3>
+                <p>window.addEventListener("blur", fn)</p>
+                <span id="det-C" class="badge idle">等待切换标签页</span>
+            </div>
+
+            <!-- D: window.onblur 属性 -->
+            <div class="detector">
+                <h3>D. window.onblur 属性</h3>
+                <p>window.onblur = fn</p>
+                <span id="det-D" class="badge idle">等待切换标签页</span>
+            </div>
+
+            <!-- E: document.hasFocus() 轮询 -->
+            <div class="detector">
+                <h3>E. hasFocus() 轮询</h3>
+                <p>setInterval(() => document.hasFocus(), 500)</p>
+                <span id="det-E" class="badge idle">等待切换标签页</span>
+            </div>
+
+            <!-- F: document.hidden 轮询 -->
+            <div class="detector">
+                <h3>F. document.hidden 轮询</h3>
+                <p>setInterval(() => document.hidden, 500)</p>
+                <span id="det-F" class="badge idle">等待切换标签页</span>
+            </div>
+
+            <!-- G: Document.prototype.hidden 直接访问 -->
+            <div class="detector">
+                <h3>G. 原型链 hidden 读取</h3>
+                <p>Object.getOwnPropertyDescriptor(Document.prototype, "hidden").get.call(document)</p>
+                <span id="det-G" class="badge idle">等待切换标签页</span>
+                <span id="det-G-note" style="font-size:11px;color:#999;"></span>
+            </div>
+
+            <!-- H: requestAnimationFrame 检测 -->
+            <div class="detector">
+                <h3>H. requestAnimationFrame 间隔检测</h3>
+                <p>检测 rAF 回调间隔 > 200ms 视为隐藏</p>
+                <span id="det-H" class="badge idle">等待切换标签页</span>
+            </div>
+
+            <!-- I: window focus 事件 -->
+            <div class="detector">
+                <h3>I. window focus 事件监听</h3>
+                <p>window.addEventListener("focus", fn) — 不应收到事件</p>
+                <span id="det-I" class="badge idle">等待切换标签页</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- ======================== 综合攻击模拟 ======================== -->
+    <div class="section">
+        <h2>⚔ 综合攻击模拟</h2>
+        <p style="font-size:13px;color:#888;margin:0 0 8px 0;">
+            启用后，页面将同时使用所有检测机制来暂停媒体。如果 Auto Player 全部阻止，媒体应继续播放。
+        </p>
+        <button class="btn-danger" onclick="startCombinedAttack()">🚀 启动综合攻击</button>
+        <button class="btn-test" onclick="stopCombinedAttack()">🛑 停止综合攻击</button>
+        <div id="attack-summary"></div>
+    </div>
+
+    <!-- ======================== 事件日志 ======================== -->
+    <div class="section">
+        <h2>📝 事件日志</h2>
+        <div id="log">等待事件...\n</div>
+        <button class="btn-test btn-sm" onclick="clearLog()">清除日志</button>
+    </div>
+
+    <script>
+        // =============================================================
+        // 工具
+        // =============================================================
+        const logEl = document.getElementById("log");
+        function appendLog(msg) {
+            const ts = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+            logEl.textContent += `[${ts}] ${msg}\n`;
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+        function clearLog() { logEl.textContent = ""; }
+
+        function setBadge(id, cls, text) {
+            const el = document.getElementById(id);
+            if (el) { el.className = "badge " + cls; el.textContent = text; }
+        }
+
+        // =============================================================
+        // 媒体状态
+        // =============================================================
+        const video = document.getElementById("test-video");
+        const audio = document.getElementById("test-audio");
+
+        video.addEventListener("play", () => { setBadge("video-status", "ok", "播放中"); appendLog("▶ 视频播放"); });
+        video.addEventListener("pause", () => { setBadge("video-status", "warn", "暂停"); appendLog("⏸ 视频暂停"); });
+        audio.addEventListener("play", () => { setBadge("audio-status", "ok", "播放中"); appendLog("▶ 音频播放"); });
+        audio.addEventListener("pause", () => { setBadge("audio-status", "warn", "暂停"); appendLog("⏸ 音频暂停"); });
+
+        // =============================================================
+        // Visibility API 实时显示
+        // =============================================================
+        function updateVisibility() {
+            document.getElementById("val-hidden").textContent = document.hidden;
+            document.getElementById("val-state").textContent = document.visibilityState;
+            document.getElementById("val-focus").textContent = document.hasFocus();
+            // 尝试通过原型链读取真实值
+            try {
+                const desc = Object.getOwnPropertyDescriptor(Document.prototype, "hidden");
+                document.getElementById("val-proto-hidden").textContent = desc ? desc.get.call(document) : "N/A";
+            } catch (e) {
+                document.getElementById("val-proto-hidden").textContent = "error";
+            }
+        }
+        updateVisibility();
+        setInterval(updateVisibility, 1000);
+
+        // =============================================================
+        // 检测器 A: visibilitychange addEventListener
+        // =============================================================
+        document.addEventListener("visibilitychange", () => {
+            if (document.hidden) {
+                setBadge("det-A", "fail", "❌ 检测到离开");
+                appendLog("🔍 [A] visibilitychange → hidden=true → 检测到离开!");
+            } else {
+                setBadge("det-A", "ok", "✅ 已阻止");
+                appendLog("🔍 [A] visibilitychange → hidden=false → 页面可见");
+            }
+        });
+        // 如果事件完全不触发,说明被拦截了(更好的结果)
+        // 用定时器检测:如果一段时间内没有触发,说明该检测器被阻止
+
+        // =============================================================
+        // 检测器 B: document.onvisibilitychange 属性
+        // =============================================================
+        document.onvisibilitychange = function () {
+            if (document.hidden) {
+                setBadge("det-B", "fail", "❌ 检测到离开");
+                appendLog("🔍 [B] onvisibilitychange 属性 → 检测到离开!");
+            } else {
+                setBadge("det-B", "ok", "✅ 已阻止");
+                appendLog("🔍 [B] onvisibilitychange 属性 → 页面可见");
+            }
+        };
+
+        // =============================================================
+        // 检测器 C: window blur addEventListener
+        // =============================================================
+        window.addEventListener("blur", () => {
+            setBadge("det-C", "fail", "❌ 检测到离开");
+            appendLog("🔍 [C] window.blur → 检测到离开!");
+        });
+
+        // =============================================================
+        // 检测器 D: window.onblur 属性
+        // =============================================================
+        window.onblur = function () {
+            setBadge("det-D", "fail", "❌ 检测到离开");
+            appendLog("🔍 [D] window.onblur → 检测到离开!");
+        };
+
+        // =============================================================
+        // 检测器 E: document.hasFocus() 轮询
+        // =============================================================
+        let hasFocusWasTrue = true;
+        setInterval(() => {
+            const focused = document.hasFocus();
+            if (!focused && hasFocusWasTrue) {
+                setBadge("det-E", "fail", "❌ 检测到离开");
+                appendLog("🔍 [E] hasFocus()=false → 检测到离开!");
+            } else if (focused && !hasFocusWasTrue) {
+                setBadge("det-E", "ok", "✅ 已阻止");
+                appendLog("🔍 [E] hasFocus()=true → 恢复");
+            } else if (focused) {
+                // 保持正常状态
+                const el = document.getElementById("det-E");
+                if (el && el.classList.contains("idle")) {
+                    setBadge("det-E", "ok", "✅ 已阻止");
+                }
+            }
+            hasFocusWasTrue = focused;
+        }, 500);
+
+        // =============================================================
+        // 检测器 F: document.hidden 轮询
+        // =============================================================
+        setInterval(() => {
+            if (document.hidden) {
+                setBadge("det-F", "fail", "❌ 检测到离开");
+                appendLog("🔍 [F] document.hidden=true → 检测到离开!");
+            } else {
+                const el = document.getElementById("det-F");
+                if (el && el.classList.contains("idle")) {
+                    setBadge("det-F", "ok", "✅ 已阻止");
+                }
+            }
+        }, 500);
+
+        // =============================================================
+        // 检测器 G: Document.prototype.hidden 直接访问
+        // (这是对 Auto Player 最严格的测试)
+        // =============================================================
+        setInterval(() => {
+            try {
+                const desc = Object.getOwnPropertyDescriptor(Document.prototype, "hidden");
+                if (desc && desc.get) {
+                    const realHidden = desc.get.call(document);
+                    if (realHidden) {
+                        setBadge("det-G", "warn", "⚠ 原型链泄露");
+                        document.getElementById("det-G-note").textContent =
+                            "（原型级别的覆盖被绕过，但上层 API 仍受保护）";
+                    } else {
+                        const el = document.getElementById("det-G");
+                        if (el && el.classList.contains("idle")) {
+                            setBadge("det-G", "ok", "✅ 已阻止");
+                        }
+                    }
+                }
+            } catch (e) {
+                setBadge("det-G", "ok", "✅ 已阻止（getter 被拦截）");
+            }
+        }, 500);
+
+        // =============================================================
+        // 检测器 H: requestAnimationFrame 间隔检测
+        // =============================================================
+        let lastRAFTime = performance.now();
+        let rAFDetected = false;
+
+        function rAFLoop(now) {
+            const gap = now - lastRAFTime;
+            lastRAFTime = now;
+            // 浏览器隐藏标签页时 rAF 暂停, 恢复后间隔远大于 16ms
+            if (gap > 200 && !rAFDetected) {
+                rAFDetected = true;
+                setBadge("det-H", "fail", "❌ 检测到离开（" + Math.round(gap) + "ms 间隔）");
+                appendLog(`🔍 [H] rAF 间隔=${Math.round(gap)}ms → 检测到离开!`);
+            } else if (gap <= 200) {
+                rAFDetected = false;
+                const el = document.getElementById("det-H");
+                if (el && (el.classList.contains("idle") || el.classList.contains("fail"))) {
+                    setBadge("det-H", "ok", "✅ 已阻止");
+                }
+            }
+            requestAnimationFrame(rAFLoop);
+        }
+        requestAnimationFrame(rAFLoop);
+
+        // =============================================================
+        // 检测器 I: window focus 事件
+        // (如果收到 focus 但之前没有 blur, 说明阻止正常)
+        // =============================================================
+        let sawBlur = false;
+        // 注意: blur 检测器 C 已经监听了 blur. 这里只监听 focus.
+        window.addEventListener("focus", () => {
+            // 如果之前 blur 被阻止了, 收到 focus 不说明什么
+            // 如果之前看到了 blur (说明没被阻止), 再看到 focus 也不影响
+            setBadge("det-I", "warn", "⚠ 收到 focus 事件");
+            appendLog("🔍 [I] window.focus → 收到事件");
+        });
+
+        // =============================================================
+        // 综合攻击模拟
+        // =============================================================
+        let attackActive = false;
+        let attackVisHandler = null;
+        let attackBlurHandler = null;
+        let attackPollTimer = null;
+
+        function pauseAllMedia(reason) {
+            appendLog(`⚔ 综合攻击 [${reason}] → 尝试暂停所有媒体`);
+            video.pause();
+            audio.pause();
+        }
+
+        function startCombinedAttack() {
+            if (attackActive) return;
+            attackActive = true;
+
+            // 策略1: visibilitychange
+            attackVisHandler = function () {
+                if (document.hidden) pauseAllMedia("visibilitychange");
+            };
+            document.addEventListener("visibilitychange", attackVisHandler);
+
+            // 策略2: window blur
+            attackBlurHandler = function () {
+                pauseAllMedia("window.blur");
+            };
+            window.addEventListener("blur", attackBlurHandler);
+
+            // 策略3: hasFocus/hidden 轮询
+            attackPollTimer = setInterval(() => {
+                if (!document.hasFocus()) pauseAllMedia("hasFocus轮询");
+                if (document.hidden) pauseAllMedia("hidden轮询");
+            }, 300);
+
+            // 策略4: onvisibilitychange 属性
+            document.onvisibilitychange = function () {
+                if (document.hidden) pauseAllMedia("onvisibilitychange属性");
+            };
+
+            // 策略5: window.onblur 属性
+            window.onblur = function () {
+                pauseAllMedia("window.onblur属性");
+            };
+
+            document.getElementById("attack-summary").innerHTML =
+                '<span class="badge fail">综合攻击已启动</span> — 使用 5 种检测机制同时攻击';
+            appendLog("⚔ 综合攻击已启动: visibilitychange + blur + 轮询 + on* 属性");
+        }
+
+        function stopCombinedAttack() {
+            if (!attackActive) return;
+            attackActive = false;
+
+            if (attackVisHandler) {
+                document.removeEventListener("visibilitychange", attackVisHandler);
+                attackVisHandler = null;
+            }
+            if (attackBlurHandler) {
+                window.removeEventListener("blur", attackBlurHandler);
+                attackBlurHandler = null;
+            }
+            if (attackPollTimer) {
+                clearInterval(attackPollTimer);
+                attackPollTimer = null;
+            }
+            document.onvisibilitychange = null;
+            window.onblur = null;
+
+            document.getElementById("attack-summary").innerHTML =
+                '<span class="badge idle">综合攻击已停止</span>';
+            appendLog("⚔ 综合攻击已停止");
+        }
+
+        appendLog("✅ 测试页面已加载 — 各检测器已就绪");
+        appendLog("💡 请切换到其他标签页测试 Auto Player 是否有效");
+    </script>
+</body>
+
+</html>
